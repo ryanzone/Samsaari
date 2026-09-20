@@ -181,8 +181,25 @@ def run_weather_engine(
 
     # 6. POST live payload to backend simulation core
     print(f"Posting live payload to backend ({backend_url})...", flush=True)
-    sim_response = requests.post(backend_url, json=payload, timeout=60)
+
+    sim_response = requests.post(
+        backend_url,
+        json=payload,
+        timeout=60
+    )
+
+    print(
+        f"Backend HTTP Status: {sim_response.status_code}",
+        flush=True
+    )
+
+    print(
+        f"Backend Response:\n{sim_response.text}",
+        flush=True
+    )
+
     sim_response.raise_for_status()
+
     result = sim_response.json()
 
     print("\n--- Live Simulation Result from Backend ---", flush=True)

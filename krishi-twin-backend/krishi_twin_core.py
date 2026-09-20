@@ -60,7 +60,7 @@ for case in scenarios:
     print(f"\nRunning {case['scenario_name']}...")
     
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model="gemini-3.5-flash",
         contents=json.dumps(case),
         config=types.GenerateContentConfig(
             response_mime_type="application/json",

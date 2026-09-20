@@ -58,7 +58,7 @@ Output a JSON object with these exact keys:
 # 4. Generate the Decision
 print("Running Krishi-Twin Simulation...")
 response = client.models.generate_content(
-    model="gemini-3.6-flash",
+    model="gemini-3.1-flash-lite",
     contents=json.dumps(farm_data),
     config=types.GenerateContentConfig(
         response_mime_type="application/json",

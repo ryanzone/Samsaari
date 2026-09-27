@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import io
+from urllib import response
 
 import torch
 from PIL import Image
@@ -17,6 +18,7 @@ from google.genai import types
 from google.cloud import translate
 from google.cloud import texttospeech
 
+from audioPipeline import resolve_language_from_coordinates
 
 # ============================================================
 # ENVIRONMENT
@@ -241,20 +243,18 @@ REGIONAL_VOICES = {
 class KrishiTwinResponse(BaseModel):
 
     recommended_action: str
-
     scenario_a_roi_inr: str
-
     scenario_b_roi_inr: str
-
     risk_factor: str
-
     voice_script_2_sentences: str
 
     disease: str | None = None
-
     disease_confidence: float | None = None
-
     disease_uncertain: bool = False
+
+    resolved_language: str | None = None
+    translated_text: str | None = None
+    audio_base64: str | None = None
 
 
 class MultimodalSimulationRequest(BaseModel):
@@ -284,10 +284,107 @@ class MultimodalSimulationRequest(BaseModel):
 class MultilingualTTSRequest(BaseModel):
 
     text: str
+    latitude: float
+    longitude: float
 
-    target_lang: str = "en"
+# ============================================================
+# MULTILINGUAL ADVISORY AUDIO
+# ============================================================
 
+def generate_advisory_audio(
+    text: str,
+    latitude: float,
+    longitude: float
+):
+    target_lang = resolve_language_from_coordinates(
+        latitude,
+        longitude
+    )
 
+    print(
+        f"Resolved language: {target_lang}",
+        flush=True
+    )
+
+    translated_text = text
+
+    if target_lang != "en":
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+
+        if not project_id:
+            raise ValueError(
+                "GOOGLE_CLOUD_PROJECT is not set."
+            )
+
+        parent = (
+            f"projects/{project_id}/locations/global"
+        )
+
+        translation_response = (
+            translate_client.translate_text(
+                request={
+                    "parent": parent,
+                    "contents": [text],
+                    "mime_type": "text/plain",
+                    "source_language_code": "en",
+                    "target_language_code": target_lang
+                }
+            )
+        )
+
+        if translation_response.translations:
+            translated_text = (
+                translation_response
+                .translations[0]
+                .translated_text
+            )
+
+    voice_config = REGIONAL_VOICES.get(
+        target_lang,
+        REGIONAL_VOICES["en"]
+    )
+
+    synthesis_input = texttospeech.SynthesisInput(
+        text=translated_text
+    )
+
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=voice_config["language_code"],
+        name=voice_config["name"],
+        ssml_gender=voice_config["ssml_gender"]
+    )
+
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=0.90
+    )
+
+    tts_response = tts_client.synthesize_speech(
+        input=synthesis_input,
+        voice=voice,
+        audio_config=audio_config
+    )
+
+    audio_bytes = tts_response.audio_content
+
+    print(
+        f"Translated text: {translated_text}",
+        flush=True
+    )
+
+    print(
+        f"Audio generated: {len(audio_bytes)} bytes",
+        flush=True
+    )
+
+    return {
+        "resolved_language": target_lang,
+        "translated_text": translated_text,
+        "audio_base64": base64.b64encode(
+            audio_bytes
+        ).decode("utf-8")
+    }
 # ============================================================
 # RICE DISEASE INFERENCE
 # ============================================================
@@ -514,7 +611,7 @@ IMPORTANT:
 
         response = (
             ai_client.models.generate_content(
-                model="gemini-3.1-flash-lite",
+                model="gemini-3.5-flash-lite",
 
                 contents=contents,
 
@@ -551,6 +648,25 @@ IMPORTANT:
             )
         )
 
+        # SAFETY OVERRIDE
+        if disease_result["uncertain"]:
+            result.recommended_action = "WAIT"
+
+            result.risk_factor = (
+                f"Disease prediction confidence is below the 70% threshold "
+                f"at {disease_result['confidence']:.1%}. "
+                "The result is uncertain, so a clearer crop image is needed "
+                "before taking disease-specific action."
+            )
+
+            result.voice_script_2_sentences = (
+                "Do not spray your rice crop yet because the disease result is uncertain. "
+                "Please take a clearer photo of the affected leaf and check again."
+            )
+
+        result.disease = disease_result["disease"]
+        result.disease_confidence = disease_result["confidence"]
+        result.disease_uncertain = disease_result["uncertain"]
 
         # --------------------------------------------------------
         # Attach V2 disease result
@@ -568,6 +684,38 @@ IMPORTANT:
             disease_result["uncertain"]
         )
 
+
+        # --------------------------------------------------------
+        # Generate multilingual advisory audio
+        # --------------------------------------------------------
+
+        coordinates = payload.farm_profile.get(
+            "coordinates",
+            {}
+        )
+
+        latitude = coordinates.get("latitude")
+        longitude = coordinates.get("longitude")
+
+        if latitude is not None and longitude is not None:
+
+            audio_result = generate_advisory_audio(
+                text=result.voice_script_2_sentences,
+                latitude=latitude,
+                longitude=longitude
+            )
+
+            result.resolved_language = (
+                audio_result["resolved_language"]
+            )
+
+            result.translated_text = (
+                audio_result["translated_text"]
+            )
+
+            result.audio_base64 = (
+                audio_result["audio_base64"]
+            )
 
         return result
 
@@ -589,36 +737,62 @@ IMPORTANT:
             status_code=500,
             detail=str(e)
         )
-
+    
 
 # ============================================================
 # TEXT TO SPEECH ENDPOINT
 # ============================================================
 
-@app.post(
-    "/api/v1/tts"
-)
+# ============================================================
+# MULTILINGUAL TTS
+# ============================================================
+
+from audioPipeline import resolve_language_from_coordinates
+
+
+class MultilingualTTSRequest(BaseModel):
+    text: str
+    latitude: float
+    longitude: float
+
+
+@app.post("/api/v1/tts")
 async def generate_multilingual_tts(
     payload: MultilingualTTSRequest
 ):
-
     try:
+        print("\n--- MULTILINGUAL TTS ---", flush=True)
+        print(f"Text: {payload.text}", flush=True)
+        print(
+            f"Coordinates: {payload.latitude}, {payload.longitude}",
+            flush=True
+        )
 
-        translated_text = payload.text
+        # --------------------------------------------------------
+        # Resolve language from farm coordinates
+        # --------------------------------------------------------
+        target_lang = resolve_language_from_coordinates(
+            payload.latitude,
+            payload.longitude
+        )
 
+        print(
+            f"Resolved language: {target_lang}",
+            flush=True
+        )
 
         # --------------------------------------------------------
         # Translation
         # --------------------------------------------------------
+        translated_text = payload.text
 
-        if payload.target_lang != "en":
+        if target_lang != "en":
 
             project_id = os.getenv(
                 "GOOGLE_CLOUD_PROJECT"
             )
 
             if not project_id:
-
                 raise ValueError(
                     "GOOGLE_CLOUD_PROJECT is not set."
                 )
@@ -631,111 +805,108 @@ async def generate_multilingual_tts(
                 translate_client.translate_text(
                     request={
                         "parent": parent,
-
                         "contents": [
                             payload.text
                         ],
-
-                        "mime_type":
-                            "text/plain",
-
-                        "source_language_code":
-                            "en",
-
-                        "target_language_code":
-                            payload.target_lang
+                        "mime_type": "text/plain",
+                        "source_language_code": "en",
+                        "target_language_code": target_lang
                     }
                 )
             )
 
             if translation_response.translations:
-
                 translated_text = (
                     translation_response
                     .translations[0]
                     .translated_text
                 )
 
-
         # --------------------------------------------------------
         # Select regional voice
         # --------------------------------------------------------
-
         voice_config = REGIONAL_VOICES.get(
-            payload.target_lang,
+            target_lang,
             REGIONAL_VOICES["en"]
         )
-
 
         # --------------------------------------------------------
         # Create TTS input
         # --------------------------------------------------------
-
         synthesis_input = (
             texttospeech.SynthesisInput(
                 text=translated_text
             )
         )
 
-
         # --------------------------------------------------------
         # Voice configuration
         # --------------------------------------------------------
-
         voice = (
             texttospeech.VoiceSelectionParams(
-                language_code=
-                    voice_config["language_code"],
-
-                name=
-                    voice_config["name"],
-
-                ssml_gender=
-                    voice_config["ssml_gender"]
+                language_code=voice_config["language_code"],
+                name=voice_config["name"],
+                ssml_gender=voice_config["ssml_gender"]
             )
         )
-
 
         # --------------------------------------------------------
         # Audio configuration
         # --------------------------------------------------------
-
         audio_config = (
             texttospeech.AudioConfig(
-                audio_encoding=
-                    texttospeech.AudioEncoding.MP3,
-
+                audio_encoding=texttospeech.AudioEncoding.MP3,
                 speaking_rate=0.90
             )
         )
 
-
         # --------------------------------------------------------
         # Generate speech
         # --------------------------------------------------------
-
         tts_response = (
             tts_client.synthesize_speech(
                 input=synthesis_input,
-
                 voice=voice,
-
                 audio_config=audio_config
             )
         )
 
+        audio_bytes = tts_response.audio_content
 
-        return Response(
-            content=tts_response.audio_content,
-            media_type="audio/mpeg"
+        print(
+            f"Translated text: {translated_text}",
+            flush=True
         )
 
+        print(
+            f"Audio generated: {len(audio_bytes)} bytes",
+            flush=True
+        )
+
+        # --------------------------------------------------------
+        # Return MP3 + metadata
+        # --------------------------------------------------------
+        return Response(
+            content=audio_bytes,
+            media_type="audio/mpeg",
+            headers={
+                
+                "X-Resolved-Language": target_lang,
+                "Content-Disposition":
+                    "inline; filename=advisory.mp3"
+            }
+        )
 
     except Exception as e:
 
         print(
-            f"\n--- BACKEND TTS CRASH ---\n"
-            f"{type(e).__name__}: {str(e)}\n"
+            "\n--- BACKEND TTS CRASH ---",
+            flush=True
+        )
+
+        print(
+            f"{type(e).__name__}: {str(e)}",
+            flush=True
         )
 
         raise HTTPException(

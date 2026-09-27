@@ -3,7 +3,7 @@ import sys
 import json
 import requests
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -48,8 +48,8 @@ def fetch_sentinel2_ndvi(lat: float, lon: float) -> float:
             ee.Initialize()
 
         point = ee.Geometry.Point([lon, lat])
-        start_date = (datetime.utcnow() - timedelta(days=120)).strftime("%Y-%m-%d")
-        end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        start_date = (datetime.now(timezone.utc) - timedelta(days=120)).strftime("%Y-%m-%d")
+        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         s2_collection = (
             ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")

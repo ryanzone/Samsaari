@@ -1,4 +1,4 @@
-# Samsaari Rice Disease Detection Model — Final Results
+# Samsaari Rice Disease Detection Model — Final Results (Old)
 
 ## Model Details
 

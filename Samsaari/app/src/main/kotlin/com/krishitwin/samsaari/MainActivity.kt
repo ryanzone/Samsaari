@@ -1,11 +1,28 @@
 package com.krishitwin.samsaari
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
+
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,13 +45,23 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+
+import androidx.core.content.ContextCompat
+
 import kotlinx.coroutines.delay
+
+import java.io.File
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -365,27 +392,113 @@ fun NavItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String
 private enum class CameraState { Scanning, ImagePreview, Analyzing }
 
 @Composable
-fun CropScanScreen(onBack: () -> Unit, onAnalysisComplete: () -> Unit) {
-    var currentState by remember { mutableStateOf(CameraState.Scanning) }
+fun CropScanScreen(
+    onBack: () -> Unit,
+    onAnalysisComplete: () -> Unit
+) {
+    var currentState by remember {
+        mutableStateOf(CameraState.Scanning)
+    }
+
+    var capturedFile by remember {
+        mutableStateOf<File?>(null)
+    }
 
     SamsaariBackground {
-        Column(modifier = Modifier.fillMaxSize().padding(top = 48.dp, bottom = 24.dp)) {
-            // Header
-            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                IconButton(onClick = { if (currentState == CameraState.ImagePreview) currentState = CameraState.Scanning else onBack() }, modifier = Modifier.clip(CircleShape).background(CardBackground)) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 48.dp, bottom = 24.dp)
+        ) {
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+
+                IconButton(
+                    onClick = {
+                        if (currentState == CameraState.ImagePreview) {
+                            capturedFile = null
+                            currentState = CameraState.Scanning
+                        } else {
+                            onBack()
+                        }
+                    },
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(CardBackground)
+                ) {
+                    Icon(
+                        Icons.Default.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.White
+                    )
                 }
-                Text("Crop Scan", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Text("Samsaari", color = MintAccent.copy(0.8f), fontSize = 18.sp, fontFamily = FontFamily.Serif)
+
+                Text(
+                    "Crop Scan",
+                    color = Color.White,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    "Samsaari",
+                    color = MintAccent.copy(0.8f),
+                    fontSize = 18.sp,
+                    fontFamily = FontFamily.Serif
+                )
             }
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            Crossfade(targetState = currentState, label = "Camera State") { state ->
+            Crossfade(
+                targetState = currentState,
+                label = "Camera State"
+            ) { state ->
+
                 when (state) {
-                    CameraState.Scanning -> LiveCameraView(onCapture = { currentState = CameraState.ImagePreview })
-                    CameraState.ImagePreview -> CapturedPreviewView(onRetake = { currentState = CameraState.Scanning }, onUsePhoto = { currentState = CameraState.Analyzing })
-                    CameraState.Analyzing -> AnalyzingView(onAnalysisComplete = onAnalysisComplete)
+
+                    CameraState.Scanning -> {
+                        LiveCameraView(
+                            onPhotoCaptured = { file ->
+                                capturedFile = file
+                                currentState = CameraState.ImagePreview
+                            },
+                            onGallerySelected = { file ->
+                                capturedFile = file
+                                currentState = CameraState.ImagePreview
+                            }
+                        )
+                    }
+
+                    CameraState.ImagePreview -> {
+                        capturedFile?.let { file ->
+
+                            CapturedPreviewView(
+                                file = file,
+
+                                onRetake = {
+                                    capturedFile = null
+                                    currentState = CameraState.Scanning
+                                },
+
+                                onUsePhoto = {
+                                    currentState = CameraState.Analyzing
+                                }
+                            )
+                        }
+                    }
+
+                    CameraState.Analyzing -> {
+                        AnalyzingView(
+                            onAnalysisComplete = onAnalysisComplete
+                        )
+                    }
                 }
             }
         }
@@ -393,81 +506,548 @@ fun CropScanScreen(onBack: () -> Unit, onAnalysisComplete: () -> Unit) {
 }
 
 @Composable
-fun LiveCameraView(onCapture: () -> Unit) {
-    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp).clip(RoundedCornerShape(24.dp)).background(Color.Black)) {
-            Canvas(modifier = Modifier.fillMaxSize().graphicsLayer { alpha = 0.99f }) {
-                drawRect(color = Color.Black.copy(alpha = 0.5f))
-                val cutoutWidth = size.width * 0.8f
-                val cutoutHeight = size.height * 0.6f
-                val topLeftX = (size.width - cutoutWidth) / 2
-                val topLeftY = (size.height - cutoutHeight) / 2
-                
-                drawRoundRect(
-                    color = Color.Transparent,
-                    topLeft = Offset(topLeftX, topLeftY),
-                    size = Size(cutoutWidth, cutoutHeight),
-                    cornerRadius = CornerRadius(40f, 40f),
-                    blendMode = BlendMode.Clear
-                )
-                drawRoundRect(
-                    color = MintAccent.copy(alpha = 0.8f),
-                    topLeft = Offset(topLeftX, topLeftY),
-                    size = Size(cutoutWidth, cutoutHeight),
-                    cornerRadius = CornerRadius(40f, 40f),
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 6f)
-                )
-            }
-            Text("Position the affected leaf inside the frame", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(horizontal = 40.dp))
-            Column(modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Info, contentDescription = null, tint = MintAccent, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Keep the leaf well lit", color = Color.White, fontSize = 14.sp)
-                }
-                Text("Move closer if needed", color = Color.White.copy(0.8f), fontSize = 14.sp)
+fun LiveCameraView(
+    onPhotoCaptured: (File) -> Unit,
+    onGallerySelected: (File) -> Unit
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    var imageCapture by remember {
+        mutableStateOf<ImageCapture?>(null)
+    }
+
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    val permissionLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            hasCameraPermission = granted
+        }
+
+    val galleryLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.GetContent()
+        ) { uri: Uri? ->
+
+            uri ?: return@rememberLauncherForActivityResult
+
+            val file = uriToFile(
+                context,
+                uri
+            )
+
+            if (file != null) {
+                onGallerySelected(file)
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+    LaunchedEffect(Unit) {
+        if (!hasCameraPermission) {
+            permissionLauncher.launch(
+                Manifest.permission.CAMERA
+            )
+        }
+    }
 
-        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 40.dp, vertical = 20.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { }, modifier = Modifier.size(56.dp).clip(CircleShape).background(CardBackground)) {
-                Icon(Icons.Default.Star, contentDescription = "Flash", tint = Color.White) 
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(modifier = Modifier.size(80.dp).clip(CircleShape).background(Color.White.copy(0.3f)).clickable { onCapture() }, contentAlignment = Alignment.Center) {
-                    Box(modifier = Modifier.size(64.dp).clip(CircleShape).background(MintAccent).border(2.dp, Color.White, CircleShape))
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(Color.Black)
+        ) {
+
+            if (hasCameraPermission) {
+
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+
+                    factory = { ctx ->
+
+                        val previewView =
+                            PreviewView(ctx)
+
+                        val cameraProviderFuture =
+                            ProcessCameraProvider
+                                .getInstance(ctx)
+
+                        cameraProviderFuture.addListener({
+
+                            val cameraProvider =
+                                cameraProviderFuture.get()
+
+                            val preview =
+                                Preview.Builder()
+                                    .build()
+                                    .also {
+                                        it.surfaceProvider =
+                                            previewView.surfaceProvider
+                                    }
+
+                            val capture =
+                                ImageCapture.Builder()
+                                    .setCaptureMode(
+                                        ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+                                    )
+                                    .build()
+
+                            imageCapture = capture
+
+                            val selector =
+                                CameraSelector.DEFAULT_BACK_CAMERA
+
+                            cameraProvider.unbindAll()
+
+                            cameraProvider.bindToLifecycle(
+                                lifecycleOwner,
+                                selector,
+                                preview,
+                                capture
+                            )
+
+                        }, ContextCompat.getMainExecutor(ctx))
+
+                        previewView
+                    }
+                )
+
+                // Existing visual crop frame
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            alpha = 0.99f
+                        }
+                ) {
+
+                    val cutoutWidth =
+                        size.width * 0.8f
+
+                    val cutoutHeight =
+                        size.height * 0.6f
+
+                    val topLeftX =
+                        (size.width - cutoutWidth) / 2
+
+                    val topLeftY =
+                        (size.height - cutoutHeight) / 2
+
+                    drawRoundRect(
+                        color = MintAccent.copy(alpha = 0.8f),
+                        topLeft = Offset(
+                            topLeftX,
+                            topLeftY
+                        ),
+                        size = Size(
+                            cutoutWidth,
+                            cutoutHeight
+                        ),
+                        cornerRadius =
+                            CornerRadius(40f, 40f),
+                        style =
+                            androidx.compose.ui.graphics
+                                .drawscope.Stroke(
+                                    width = 6f
+                                )
+                    )
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Capture", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                IconButton(onClick = { }, modifier = Modifier.size(56.dp).clip(CircleShape).background(CardBackground)) {
-                    Icon(Icons.Default.Menu, contentDescription = "Gallery", tint = Color.White) 
+
+                Text(
+                    "Position the affected leaf inside the frame",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(horizontal = 40.dp)
+                )
+
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 32.dp),
+                    horizontalAlignment =
+                        Alignment.CenterHorizontally
+                ) {
+
+                    Row(
+                        verticalAlignment =
+                            Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = null,
+                            tint = MintAccent,
+                            modifier = Modifier.size(16.dp)
+                        )
+
+                        Spacer(
+                            Modifier.width(6.dp)
+                        )
+
+                        Text(
+                            "Keep the leaf well lit",
+                            color = Color.White,
+                            fontSize = 14.sp
+                        )
+                    }
+
+                    Text(
+                        "Move closer if needed",
+                        color = Color.White.copy(0.8f),
+                        fontSize = 14.sp
+                    )
                 }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text("Gallery", color = Color.White.copy(0.8f), fontSize = 12.sp)
+
+            } else {
+
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment =
+                        Alignment.CenterHorizontally,
+                    verticalArrangement =
+                        Arrangement.Center
+                ) {
+
+                    Text(
+                        "Camera permission required",
+                        color = Color.White,
+                        fontSize = 16.sp
+                    )
+
+                    Spacer(
+                        Modifier.height(12.dp)
+                    )
+
+                    Button(
+                        onClick = {
+                            permissionLauncher.launch(
+                                Manifest.permission.CAMERA
+                            )
+                        },
+                        colors =
+                            ButtonDefaults.buttonColors(
+                                containerColor =
+                                    MintAccent
+                            )
+                    ) {
+                        Text(
+                            "Allow Camera",
+                            color = EmeraldDark
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(
+            modifier = Modifier.height(32.dp)
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    horizontal = 40.dp,
+                    vertical = 20.dp
+                ),
+            horizontalArrangement =
+                Arrangement.SpaceBetween,
+            verticalAlignment =
+                Alignment.CenterVertically
+        ) {
+
+            IconButton(
+                onClick = { },
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(CircleShape)
+                    .background(CardBackground)
+            ) {
+                Icon(
+                    Icons.Default.Star,
+                    contentDescription = "Flash",
+                    tint = Color.White
+                )
+            }
+
+            Column(
+                horizontalAlignment =
+                    Alignment.CenterHorizontally
+            ) {
+
+                Box(
+                    modifier = Modifier
+                        .size(80.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Color.White.copy(0.3f)
+                        )
+                        .clickable {
+
+                            val capture =
+                                imageCapture
+                                    ?: return@clickable
+
+                            capturePhoto(
+                                context,
+                                capture,
+                                onPhotoCaptured
+                            )
+                        },
+                    contentAlignment =
+                        Alignment.Center
+                ) {
+
+                    Box(
+                        modifier = Modifier
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(MintAccent)
+                            .border(
+                                2.dp,
+                                Color.White,
+                                CircleShape
+                            )
+                    )
+                }
+
+                Spacer(
+                    Modifier.height(8.dp)
+                )
+
+                Text(
+                    "Capture",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Column(
+                horizontalAlignment =
+                    Alignment.CenterHorizontally
+            ) {
+
+                IconButton(
+                    onClick = {
+                        galleryLauncher.launch("image/*")
+                    },
+                    modifier = Modifier
+                        .size(56.dp)
+                        .clip(CircleShape)
+                        .background(CardBackground)
+                ) {
+                    Icon(
+                        Icons.Default.Menu,
+                        contentDescription = "Gallery",
+                        tint = Color.White
+                    )
+                }
+
+                Spacer(
+                    Modifier.height(4.dp)
+                )
+
+                Text(
+                    "Gallery",
+                    color = Color.White.copy(0.8f),
+                    fontSize = 12.sp
+                )
             }
         }
     }
 }
 
-@Composable
-fun CapturedPreviewView(onRetake: () -> Unit, onUsePhoto: () -> Unit) {
-    Column(modifier = Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 20.dp).clip(RoundedCornerShape(24.dp)).background(Color.DarkGray)) {
-            Text("Captured Image Preview", color = Color.White.copy(0.5f), modifier = Modifier.align(Alignment.Center))
-        }
-        Spacer(modifier = Modifier.height(32.dp))
-        Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 20.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            Button(onClick = onRetake, modifier = Modifier.weight(1f).height(64.dp), colors = ButtonDefaults.buttonColors(containerColor = CardBackground), shape = RoundedCornerShape(16.dp), border = androidx.compose.foundation.BorderStroke(1.dp, CardBorder)) {
-                Text("Retake", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+fun capturePhoto(
+    context: Context,
+    imageCapture: ImageCapture,
+    onSaved: (File) -> Unit
+) {
+    val file = File(
+        context.cacheDir,
+        "samsaari_${System.currentTimeMillis()}.jpg"
+    )
+
+    val outputOptions =
+        ImageCapture.OutputFileOptions
+            .Builder(file)
+            .build()
+
+    imageCapture.takePicture(
+        outputOptions,
+        ContextCompat.getMainExecutor(context),
+
+        object :
+            ImageCapture.OnImageSavedCallback {
+
+            override fun onImageSaved(
+                outputFileResults:
+                ImageCapture.OutputFileResults
+            ) {
+                onSaved(file)
             }
-            Button(onClick = onUsePhoto, modifier = Modifier.weight(1.5f).height(64.dp), colors = ButtonDefaults.buttonColors(containerColor = MintAccent), shape = RoundedCornerShape(16.dp)) {
-                Icon(Icons.Default.Check, contentDescription = "Use", tint = EmeraldDark)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Use Photo", color = EmeraldDark, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+
+            override fun onError(
+                exception: ImageCaptureException
+            ) {
+                exception.printStackTrace()
+            }
+        }
+    )
+}
+
+fun uriToFile(
+    context: Context,
+    uri: Uri
+): File? {
+
+    return try {
+
+        val file = File(
+            context.cacheDir,
+            "samsaari_gallery_${System.currentTimeMillis()}.jpg"
+        )
+
+        context.contentResolver
+            .openInputStream(uri)
+            ?.use { input ->
+
+                file.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+
+        file
+
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+@Composable
+fun CapturedPreviewView(
+    file: File,
+    onRetake: () -> Unit,
+    onUsePhoto: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment =
+            Alignment.CenterHorizontally
+    ) {
+
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .clip(RoundedCornerShape(24.dp))
+        ) {
+
+            Image(
+                bitmap = BitmapFactory
+                    .decodeFile(file.absolutePath)
+                    .asImageBitmap(),
+
+                contentDescription =
+                    "Captured crop",
+
+                modifier = Modifier.fillMaxSize(),
+
+                contentScale =
+                    ContentScale.Crop
+            )
+        }
+
+        Spacer(
+            modifier = Modifier.height(32.dp)
+        )
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    horizontal = 20.dp,
+                    vertical = 20.dp
+                ),
+            horizontalArrangement =
+                Arrangement.spacedBy(16.dp)
+        ) {
+
+            Button(
+                onClick = onRetake,
+                modifier = Modifier
+                    .weight(1f)
+                    .height(64.dp),
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor =
+                            CardBackground
+                    ),
+                shape =
+                    RoundedCornerShape(16.dp),
+                border =
+                    androidx.compose.foundation
+                        .BorderStroke(
+                            1.dp,
+                            CardBorder
+                        )
+            ) {
+                Text(
+                    "Retake",
+                    color = Color.White,
+                    fontSize = 18.sp
+                )
+            }
+
+            Button(
+                onClick = onUsePhoto,
+                modifier = Modifier
+                    .weight(1.5f)
+                    .height(64.dp),
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor =
+                            MintAccent
+                    ),
+                shape =
+                    RoundedCornerShape(16.dp)
+            ) {
+
+                Icon(
+                    Icons.Default.Check,
+                    contentDescription = "Use",
+                    tint = EmeraldDark
+                )
+
+                Spacer(
+                    Modifier.width(8.dp)
+                )
+
+                Text(
+                    "Use Photo",
+                    color = EmeraldDark,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }

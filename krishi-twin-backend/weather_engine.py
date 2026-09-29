@@ -28,7 +28,7 @@ retries = Retry(
     read=3,
     status=4,
     backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
+    status_forcelist=[500, 502, 503, 504],
     allowed_methods=["GET", "HEAD"],
     respect_retry_after_header=True,
     raise_on_status=False,
@@ -274,11 +274,11 @@ def resolve_location_from_coordinates(lat: float, lon: float) -> dict:
     """
     Resolve district/state from the actual farm GPS coordinates.
 
-    No location is hardcoded. If reverse geocoding fails, the request
-    fails instead of inventing a district.
+    Uses the supplied GPS coordinates and Nominatim reverse geocoding.
     """
+
     try:
-        response = session.get(
+        response = requests.get(
             NOMINATIM_URL,
             params={
                 "lat": lat,
@@ -288,8 +288,14 @@ def resolve_location_from_coordinates(lat: float, lon: float) -> dict:
                 "addressdetails": 1,
             },
             headers=NOMINATIM_HEADERS,
-            timeout=10,
+            timeout=15,
         )
+
+        if response.status_code == 429:
+            raise RuntimeError(
+                "Nominatim rate limit reached. Please retry shortly."
+            )
+
         response.raise_for_status()
 
         address = response.json().get("address", {})
@@ -302,10 +308,14 @@ def resolve_location_from_coordinates(lat: float, lon: float) -> dict:
         )
 
         if not state:
-            raise RuntimeError("Nominatim did not return a state for the supplied GPS coordinates.")
+            raise RuntimeError(
+                "Nominatim did not return a state for the supplied GPS coordinates."
+            )
 
         if not district:
-            raise RuntimeError("Nominatim did not return a district for the supplied GPS coordinates.")
+            raise RuntimeError(
+                "Nominatim did not return a district for the supplied GPS coordinates."
+            )
 
         location = {
             "state": state.strip(),

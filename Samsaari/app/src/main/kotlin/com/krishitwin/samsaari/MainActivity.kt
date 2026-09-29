@@ -20,6 +20,7 @@ import android.location.Location
 import android.location.LocationManager
 import android.os.Looper
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -1121,23 +1122,35 @@ fun CapturedPreviewView(
     }
 }
 suspend fun getCurrentLocation(context: Context): Location? {
-    if (
+    val fineGranted =
         ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_FINE_LOCATION
-        ) != PackageManager.PERMISSION_GRANTED &&
+        ) == PackageManager.PERMISSION_GRANTED
+
+    val coarseGranted =
         ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.ACCESS_COARSE_LOCATION
-        ) != PackageManager.PERMISSION_GRANTED
-    ) {
+        ) == PackageManager.PERMISSION_GRANTED
+
+    if (!fineGranted && !coarseGranted) {
+        Log.e("Samsaari", "Location permission not granted")
         return null
     }
 
     val locationManager =
         context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
-    // Use existing GPS location first
+    if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+        Log.e("Samsaari", "GPS provider is disabled")
+        return null
+    }
+
+    /*
+     * GPS is intentionally the only location source used for the farm
+     * coordinates. Do not substitute network/provider coordinates.
+     */
     try {
         val gpsLocation =
             locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
@@ -1149,75 +1162,71 @@ suspend fun getCurrentLocation(context: Context): Location? {
             )
             return gpsLocation
         }
-
-        // Fallback to network location
-        val networkLocation =
-            locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-
-        if (networkLocation != null) {
-            Log.d(
-                "Samsaari",
-                "Using last network location = ${networkLocation.latitude}, ${networkLocation.longitude}"
-            )
-            return networkLocation
-        }
     } catch (e: SecurityException) {
         Log.e("Samsaari", "Location permission error", e)
         return null
     }
 
-    // No cached location → request a fresh one
-    return suspendCancellableCoroutine { continuation ->
+    /*
+     * No cached GPS location: request a fresh GPS fix.
+     * A timeout prevents the analysis screen from waiting forever.
+     */
+    return withTimeoutOrNull(15_000L) {
+        suspendCancellableCoroutine { continuation ->
 
-        val listener = object : android.location.LocationListener {
+            val listener = object : android.location.LocationListener {
 
-            override fun onLocationChanged(location: Location) {
-                Log.d(
-                    "Samsaari",
-                    "Fresh GPS location = ${location.latitude}, ${location.longitude}"
-                )
+                override fun onLocationChanged(location: Location) {
+                    Log.d(
+                        "Samsaari",
+                        "Fresh GPS location = ${location.latitude}, ${location.longitude}"
+                    )
 
-                if (continuation.isActive) {
-                    continuation.resume(location)
+                    if (continuation.isActive) {
+                        continuation.resume(location)
+                    }
+
+                    locationManager.removeUpdates(this)
                 }
 
-                locationManager.removeUpdates(this)
+                override fun onProviderDisabled(provider: String) {}
+
+                override fun onProviderEnabled(provider: String) {}
+
+                @Suppress("DEPRECATION")
+                override fun onStatusChanged(
+                    provider: String?,
+                    status: Int,
+                    extras: android.os.Bundle?
+                ) {}
             }
 
-            override fun onProviderDisabled(provider: String) {}
+            try {
+                locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    1000L,
+                    1f,
+                    listener,
+                    Looper.getMainLooper()
+                )
 
-            override fun onProviderEnabled(provider: String) {}
+                continuation.invokeOnCancellation {
+                    locationManager.removeUpdates(listener)
+                }
 
-            @Suppress("DEPRECATION")
-            override fun onStatusChanged(
-                provider: String?,
-                status: Int,
-                extras: android.os.Bundle?
-            ) {}
-        }
+            } catch (e: SecurityException) {
+                Log.e("Samsaari", "Failed to request GPS", e)
 
-        try {
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                1000L,
-                1f,
-                listener,
-                Looper.getMainLooper()
-            )
-
-            continuation.invokeOnCancellation {
                 locationManager.removeUpdates(listener)
-            }
 
-        } catch (e: SecurityException) {
-            Log.e("Samsaari", "Failed to request GPS", e)
-
-            if (continuation.isActive) {
-                continuation.resume(null)
+                if (continuation.isActive) {
+                    continuation.resume(null)
+                }
             }
         }
     }
 }
+
 @Composable
 fun AnalyzingView(
     imageFile: File,
@@ -1274,11 +1283,11 @@ fun AnalyzingView(
         }
 
         try {
-            println("Samsaari: Starting analysis")
+            Log.d("Samsaari", "Starting analysis")
 
             val result = withContext(Dispatchers.IO) {
 
-                println("Samsaari: Getting current location")
+                Log.d("Samsaari", "Getting current location")
 
                 val location = getCurrentLocation(context)
 
@@ -1291,24 +1300,21 @@ fun AnalyzingView(
                 val latitude = location.latitude
                 val longitude = location.longitude
 
-                println(
-                    "Samsaari: GPS location = $latitude, $longitude"
-                )
+                Log.d("Samsaari", "GPS latitude = $latitude")
+                Log.d("Samsaari", "GPS longitude = $longitude")
 
-                println("Samsaari: Reading image")
+                Log.d("Samsaari", "Reading image")
 
                 val imageBytes = imageFile.readBytes()
 
-                println(
-                    "Samsaari: Image size = ${imageBytes.size} bytes"
-                )
+                Log.d("Samsaari", "Image size = ${imageBytes.size} bytes")
 
                 val imageBase64 = Base64.encodeToString(
                     imageBytes,
                     Base64.NO_WRAP
                 )
 
-                println("Samsaari: Base64 created")
+                Log.d("Samsaari", "Base64 created")
 
                 val payload = JSONObject().apply {
 
@@ -1374,9 +1380,7 @@ fun AnalyzingView(
                     )
                 }
 
-                println(
-                    "Samsaari: Payload coordinates = $latitude, $longitude"
-                )
+                Log.d("Samsaari", "Payload coordinates = $latitude, $longitude")
 
                 val requestBody =
                     payload
@@ -1391,7 +1395,7 @@ fun AnalyzingView(
                         .post(requestBody)
                         .build()
 
-                println("Samsaari: Sending request")
+                Log.d("Samsaari", "Sending request")
 
                 val client =
                     OkHttpClient.Builder()
@@ -1415,9 +1419,7 @@ fun AnalyzingView(
 
                 client.newCall(request).execute().use { response ->
 
-                    println(
-                        "Samsaari: HTTP ${response.code}"
-                    )
+                    Log.d("Samsaari", "HTTP ${response.code}")
 
                     val responseBody =
                         response.body?.string()
@@ -1425,13 +1427,9 @@ fun AnalyzingView(
                                 "Empty server response"
                             )
 
-                    println(
-                        "Samsaari: Response received"
-                    )
+                    Log.d("Samsaari", "Response received")
 
-                    println(
-                        "Samsaari: $responseBody"
-                    )
+                    Log.d("Samsaari", "Response body = $responseBody")
 
                     if (!response.isSuccessful) {
                         throw Exception(
@@ -1439,19 +1437,32 @@ fun AnalyzingView(
                         )
                     }
 
-                    JSONObject(responseBody)
+                    val result = JSONObject(responseBody)
+
+                    Log.d(
+                        "Samsaari",
+                        "Resolved language = ${result.optString("resolved_language", "N/A")}"
+                    )
+                    Log.d(
+                        "Samsaari",
+                        "Disease = ${result.optString("disease", "N/A")}"
+                    )
+                    Log.d(
+                        "Samsaari",
+                        "Disease confidence = ${result.optDouble("disease_confidence", 0.0)}"
+                    )
+
+                    result
                 }
             }
 
-            println("Samsaari: Analysis complete")
+            Log.d("Samsaari", "Analysis complete")
 
             onAnalysisComplete(result)
 
         } catch (e: Exception) {
 
-            println(
-                "Samsaari: ERROR ${e.javaClass.simpleName}: ${e.message}"
-            )
+            Log.e("Samsaari", "ERROR ${e.javaClass.simpleName}: ${e.message}", e)
 
             e.printStackTrace()
 
@@ -1540,7 +1551,7 @@ fun DecisionScreen(
     val recommendedAction = result.optString("recommended_action", "WAIT")
     val disease = result.optString("disease", "Unknown")
     val confidence = result.optDouble("disease_confidence", 0.0)
-    val uncertain = result.optBoolean("disease_uncertain", confidence < 0.70)
+    val uncertain = result.optBoolean("disease_uncertain", false)
     val scenarioA = result.optString("scenario_a_roi_inr", "N/A")
     val scenarioB = result.optString("scenario_b_roi_inr", "N/A")
     val risk = result.optString("risk_factor", "N/A")

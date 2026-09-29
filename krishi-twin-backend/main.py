@@ -2,7 +2,6 @@ import os
 import json
 import base64
 import io
-from urllib import response
 
 import torch
 from PIL import Image
@@ -19,6 +18,7 @@ from google.cloud import translate
 from google.cloud import texttospeech
 
 from audioPipeline import resolve_language_from_coordinates
+from weather_engine import build_dynamic_telemetry
 
 # ============================================================
 # ENVIRONMENT
@@ -265,15 +265,21 @@ class MultimodalSimulationRequest(BaseModel):
 
     farm_profile: dict
 
-    geospatial_telemetry: dict
+    geospatial_telemetry: dict = Field(
+        default_factory=dict
+    )
 
-    meteorological_risk: dict
+    meteorological_risk: dict = Field(
+        default_factory=dict
+    )
 
     market_telemetry: dict = Field(
         default_factory=dict
     )
 
-    financial_inputs: dict
+    financial_inputs: dict = Field(
+        default_factory=dict
+    )
 
     image_base64: str | None = Field(
         default=None,
@@ -474,6 +480,71 @@ async def run_multimodal_simulation(
 ):
 
     try:
+
+        # --------------------------------------------------------
+        # DYNAMIC TELEMETRY FROM PHONE GPS
+        # --------------------------------------------------------
+
+        coordinates = payload.farm_profile.get("coordinates", {})
+
+        latitude = coordinates.get("latitude")
+        longitude = coordinates.get("longitude")
+
+        if latitude is None or longitude is None:
+            raise HTTPException(
+                status_code=400,
+                detail="farm_profile.coordinates.latitude and longitude are required."
+            )
+
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="farm_profile coordinates must be valid numbers."
+            )
+
+        if not (-90 <= latitude <= 90):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid latitude: {latitude}"
+            )
+
+        if not (-180 <= longitude <= 180):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid longitude: {longitude}"
+            )
+
+        crop = payload.farm_profile.get("crop", "Rice")
+        acres = float(payload.farm_profile.get("farm_size_acres", 2.0))
+
+        print(
+            f"Production GPS: latitude={latitude}, longitude={longitude}",
+            flush=True
+        )
+
+        dynamic = build_dynamic_telemetry(
+            lat=latitude,
+            lon=longitude,
+            crop=crop,
+            acres=acres,
+        )
+
+        # Backend-generated telemetry is authoritative.
+        payload.geospatial_telemetry = dynamic["geospatial_telemetry"]
+        payload.meteorological_risk = dynamic["meteorological_risk"]
+        payload.market_telemetry = dynamic["market_telemetry"]
+        payload.financial_inputs = dynamic["financial_inputs"]
+
+        # Attach backend-resolved location to the farm profile.
+        payload.farm_profile["location"] = dynamic["location"]
+
+        print(
+            "Dynamic telemetry generated successfully from phone GPS.",
+            flush=True
+        )
 
         # --------------------------------------------------------
         # Convert telemetry into JSON
@@ -748,6 +819,7 @@ IMPORTANT:
 # ============================================================
 
 from audioPipeline import resolve_language_from_coordinates
+from weather_engine import build_dynamic_telemetry
 
 
 class MultilingualTTSRequest(BaseModel):

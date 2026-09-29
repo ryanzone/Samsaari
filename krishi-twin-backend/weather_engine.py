@@ -137,7 +137,9 @@ def fetch_sentinel2_ndvi(lat: float, lon: float) -> float:
             flush=True,
         )
 
-    return 0.37
+    raise RuntimeError(
+        "Live Sentinel-2 NDVI could not be retrieved for the supplied GPS coordinates."
+    )
 
 
 # ============================================================
@@ -244,6 +246,245 @@ def fetch_weather(lat: float, lon: float) -> dict:
 
 
 # ============================================================
+# DYNAMIC LOCATION / MARKET / TELEMETRY HELPERS
+# ============================================================
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_HEADERS = {
+    "User-Agent": "Samsaari-KrishiTwin/1.0"
+}
+
+
+def resolve_location_from_coordinates(lat: float, lon: float) -> dict:
+    """
+    Resolve district/state from the actual farm GPS coordinates.
+
+    No location is hardcoded. If reverse geocoding fails, the request
+    fails instead of inventing a district.
+    """
+    try:
+        response = session.get(
+            NOMINATIM_URL,
+            params={
+                "lat": lat,
+                "lon": lon,
+                "format": "json",
+                "zoom": 10,
+                "addressdetails": 1,
+            },
+            headers=NOMINATIM_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+
+        address = response.json().get("address", {})
+
+        state = address.get("state")
+        district = (
+            address.get("state_district")
+            or address.get("district")
+            or address.get("county")
+        )
+
+        if not state:
+            raise RuntimeError("Nominatim did not return a state for the supplied GPS coordinates.")
+
+        if not district:
+            raise RuntimeError("Nominatim did not return a district for the supplied GPS coordinates.")
+
+        location = {
+            "state": state.strip(),
+            "district": district.strip(),
+        }
+
+        print(
+            f"Dynamic location: ({lat}, {lon}) -> "
+            f"{location['district']}, {location['state']}",
+            flush=True,
+        )
+
+        return location
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Dynamic reverse geocoding failed for ({lat}, {lon}): {e}"
+        ) from e
+
+
+def fetch_market_data(crop: str, district: str) -> dict:
+    """
+    Fetch the latest available commodity-level mandi reference price
+    from Farmer.in's public open API. Farmer.in states that its data is
+    sourced from Agmarknet / Government of India.
+
+    The public endpoint is commodity-level rather than district-level, so
+    the returned price must NOT be described as an exact local mandi price.
+    The GPS-derived district is retained as location context.
+    """
+    farmer_url = "https://farmer.in/api/open/prices.json"
+
+    response = session.get(
+        farmer_url,
+        headers={
+            "User-Agent": "Samsaari-KrishiTwin/1.0",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+    commodities = data.get("commodities", [])
+
+    if not isinstance(commodities, list):
+        raise RuntimeError("Farmer.in market response has an invalid commodities field.")
+
+    normalized_crop = str(crop or "Rice").strip().lower()
+
+    aliases = {
+        "rice": "rice",
+        "paddy": "rice",
+        "paddy dhan": "rice",
+        "wheat": "wheat",
+        "maize": "maize",
+        "corn": "maize",
+        "jowar": "jowar",
+        "sorghum": "jowar",
+        "bajra": "bajra",
+        "pearl millet": "bajra",
+        "onion": "onion",
+        "potato": "potato",
+        "tomato": "tomato",
+        "garlic": "garlic",
+        "ginger": "ginger",
+        "chili": "chili",
+        "chilli": "chili",
+        "cotton": "cotton",
+        "sugarcane": "sugarcane",
+    }
+
+    target_id = aliases.get(normalized_crop, normalized_crop.replace(" ", "-"))
+
+    record = next(
+        (item for item in commodities
+         if str(item.get("id", "")).strip().lower() == target_id),
+        None,
+    )
+
+    if record is None:
+        raise RuntimeError(
+            f"Farmer.in has no market record for crop '{crop}'."
+        )
+
+    price_quintal = float(record.get("price", 0))
+
+    if price_quintal <= 0:
+        raise RuntimeError(
+            f"Farmer.in returned an invalid price for crop '{crop}'."
+        )
+
+    price_per_kg = round(price_quintal / 100.0, 2)
+
+    market_info = {
+        "market": "National commodity reference",
+        "commodity": record.get("name", crop),
+        "variety": None,
+        "modal_price_inr_quintal": price_quintal,
+        "price_inr_per_kg": price_per_kg,
+        "arrival_date": record.get("updated"),
+        "source": "Farmer.in / Agmarknet / Government of India",
+        "source_url": farmer_url,
+        "source_scope": "commodity_level_reference",
+        "district_context": district,
+        "source_updated": data.get("updated") or record.get("updated"),
+    }
+
+    print(
+        f"Market reference: {record.get('name', crop)} @ "
+        f"Rs.{price_quintal}/quintal "
+        f"(Rs.{price_per_kg}/kg) | "
+        f"district context={district} | source=Farmer.in",
+        flush=True,
+    )
+
+    return market_info
+
+
+def build_dynamic_telemetry(
+    lat: float,
+    lon: float,
+    crop: str = "Rice",
+    acres: float = 2.0,
+) -> dict:
+    """
+    Build all location-dependent telemetry from the supplied GPS coordinates.
+
+    This is the function used by the production FastAPI endpoint.
+    """
+    lat = float(lat)
+    lon = float(lon)
+
+    if not (-90 <= lat <= 90):
+        raise ValueError(f"Invalid latitude: {lat}")
+
+    if not (-180 <= lon <= 180):
+        raise ValueError(f"Invalid longitude: {lon}")
+
+    if acres <= 0:
+        raise ValueError(f"Farm size must be positive: {acres}")
+
+    print(
+        f"\n=== Building dynamic telemetry for GPS "
+        f"({lat}, {lon}) ===",
+        flush=True,
+    )
+
+    # 1. GPS-derived district/state.
+    location = resolve_location_from_coordinates(lat, lon)
+
+    # 2. Live Sentinel-2 NDVI at the GPS coordinate.
+    mean_ndvi = fetch_sentinel2_ndvi(lat, lon)
+
+    # 3. Live weather at the GPS coordinate.
+    weather = fetch_weather(lat, lon)
+
+    # 4. Live market data for the GPS-derived district.
+    market_info = fetch_market_data(crop, location["district"])
+
+    # 5. Financial calculations based on live market price.
+    modal_price_per_kg = market_info["price_inr_per_kg"]
+
+    spray_cost_inr = round(acres * 425.0, 2)
+
+    potential_crop_loss_inr = round(
+        acres * 100.0 * modal_price_per_kg,
+        2,
+    )
+
+    print(
+        f"Financial calculations: spray=Rs.{spray_cost_inr} | "
+        f"potential_loss=Rs.{potential_crop_loss_inr}",
+        flush=True,
+    )
+
+    return {
+        "location": location,
+        "geospatial_telemetry": {
+            "mean_ndvi_index": mean_ndvi,
+            "canopy_vigor": (
+                "Stressed" if mean_ndvi < 0.4 else "Healthy"
+            ),
+        },
+        "meteorological_risk": weather,
+        "market_telemetry": market_info,
+        "financial_inputs": {
+            "spray_cost_inr": spray_cost_inr,
+            "potential_crop_loss_inr": potential_crop_loss_inr,
+        },
+    }
+
+
+# ============================================================
 # MAIN WEATHER / TELEMETRY ENGINE
 # ============================================================
 
@@ -273,184 +514,20 @@ def run_weather_engine(
         flush=True,
     )
 
-    # --------------------------------------------------------
-    # 1. GOOGLE EARTH ENGINE NDVI
-    # --------------------------------------------------------
-
-    mean_ndvi = fetch_sentinel2_ndvi(
-        lat,
-        lon,
+    dynamic = build_dynamic_telemetry(
+        lat=lat,
+        lon=lon,
+        crop=crop,
+        acres=acres,
     )
 
-    # --------------------------------------------------------
-    # 2. LIVE MARKET DATA
-    # --------------------------------------------------------
-
-    # --------------------------------------------------------
-    # 2. LIVE MARKET DATA
-    # --------------------------------------------------------
-
-    gov_api_key = os.getenv("GOV_DATA_API_KEY")
-
-    gov_url = (
-        "https://api.data.gov.in/resource/"
-        "9ef84268-d588-465a-a308-a864a43d0070"
-    )
-
-    market_info = {
-        "price_inr_per_kg": 21.0,
-        "source": "baseline",
-    }
-
-    modal_price_per_kg = 21.0
-
-    if not gov_api_key:
-        print(
-            "Market Warning: GOV_DATA_API_KEY is not set "
-            "in environment/.env file.",
-            flush=True,
-        )
-        print(
-            f"Using baseline Rs.{modal_price_per_kg}/kg.",
-            flush=True,
-        )
-    else:
-        gov_params = {
-            "api-key": gov_api_key,
-            "format": "json",
-            "filters[district]": district,
-            "filters[commodity]": crop,
-            "limit": 10,
-        }
-
-        print(
-            f"Fetching live market rates from data.gov.in "
-            f"for {crop} in {district}...",
-            flush=True,
-        )
-
-        try:
-            market_response = session.get(
-                gov_url,
-                params=gov_params,
-                timeout=10,
-            )
-
-            market_response.raise_for_status()
-
-            records = market_response.json().get(
-                "records",
-                [],
-            )
-
-            if records:
-                latest = records[0]
-
-                modal_price_quintal = float(
-                    latest.get("modal_price", 0)
-                )
-
-                if modal_price_quintal > 0:
-                    modal_price_per_kg = round(
-                        modal_price_quintal / 100.0,
-                        2,
-                    )
-
-                    market_info = {
-                        "market": latest.get("market"),
-                        "commodity": latest.get("commodity"),
-                        "variety": latest.get("variety"),
-                        "modal_price_inr_quintal": modal_price_quintal,
-                        "price_inr_per_kg": modal_price_per_kg,
-                        "arrival_date": latest.get("arrival_date"),
-                        "source": "data.gov.in",
-                    }
-
-                    print(
-                        f"Market Data Fetched: {crop} @ "
-                        f"Rs.{modal_price_quintal}/quintal "
-                        f"(Rs.{modal_price_per_kg}/kg) "
-                        f"at {market_info['market']}",
-                        flush=True,
-                    )
-
-                else:
-                    print(
-                        "Market Warning: Invalid modal price. "
-                        f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                        flush=True,
-                    )
-
-            else:
-                print(
-                    f"Market Warning: No records found for "
-                    f"{crop} in {district}. "
-                    f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                    flush=True,
-                )
-
-        except requests.exceptions.Timeout:
-            print(
-                "Market Warning: data.gov.in request timed out. "
-                f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                flush=True,
-            )
-
-        except requests.exceptions.RequestException as e:
-            print(
-                f"Market Fetch Warning: {e}. "
-                f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                flush=True,
-            )
-
-        except (ValueError, TypeError) as e:
-            print(
-                f"Market Data Warning: Invalid response ({e}). "
-                f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                flush=True,
-            )
-
-        except Exception as e:
-            print(
-                f"Market Processing Warning: {e}. "
-                f"Using baseline Rs.{modal_price_per_kg}/kg.",
-                flush=True,
-            )
-
-    # --------------------------------------------------------
-    # 3. FINANCIAL CALCULATIONS
-    # --------------------------------------------------------
-
-    spray_cost_inr = (
-        spray_cost_override
-        if spray_cost_override is not None
-        else round(acres * 425.0, 2)
-    )
-
-    potential_crop_loss_inr = (
-        crop_loss_override
-        if crop_loss_override is not None
-        else round(
-            acres * 100.0 * modal_price_per_kg,
-            2,
-        )
-    )
-
-    print(
-        f"Financial Calculations: "
-        f"Spray Cost = Rs.{spray_cost_inr} | "
-        f"Potential Crop Loss = Rs.{potential_crop_loss_inr}",
-        flush=True,
-    )
-
-    # --------------------------------------------------------
-    # 4. LIVE WEATHER
-    # --------------------------------------------------------
-
-    weather = fetch_weather(
-        lat,
-        lon,
-    )
+    location = dynamic["location"]
+    district = location["district"]
+    mean_ndvi = dynamic["geospatial_telemetry"]["mean_ndvi_index"]
+    weather = dynamic["meteorological_risk"]
+    market_info = dynamic["market_telemetry"]
+    spray_cost_inr = dynamic["financial_inputs"]["spray_cost_inr"]
+    potential_crop_loss_inr = dynamic["financial_inputs"]["potential_crop_loss_inr"]
 
     # --------------------------------------------------------
     # 5. BUILD PAYLOAD

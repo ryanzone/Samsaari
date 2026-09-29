@@ -7,6 +7,21 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 
+import android.util.Base64
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+
+import android.location.Location
+import android.location.LocationManager
+import android.os.Looper
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -63,6 +78,10 @@ import kotlinx.coroutines.delay
 
 import java.io.File
 
+private const val API_BASE_URL = "https://samsaari.onrender.com"
+private const val API_URL =
+    "https://samsaari.onrender.com/api/v1/simulate"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,6 +102,7 @@ private enum class Screen {
 @Composable
 fun SamsaariApp() {
     var screen by remember { mutableStateOf(Screen.Splash) }
+    var analysisResult by remember { mutableStateOf<JSONObject?>(null) }
 
     Crossfade(targetState = screen, label = "AppRouter") { currentScreen ->
         when (currentScreen) {
@@ -94,12 +114,45 @@ fun SamsaariApp() {
                 onHistory = { screen = Screen.History },
                 onSettings = { screen = Screen.Settings }
             )
-            Screen.Camera -> CropScanScreen(
-                onBack = { screen = Screen.Dashboard },
-                onAnalysisComplete = { screen = Screen.Decision }
-            )
-            Screen.Decision -> PlaceholderScreen("Decision (Scenario A vs B)", onClick = { screen = Screen.Dashboard })
-            Screen.AudioPlay -> PlaceholderScreen("Audio Advisory", onClick = { screen = Screen.Dashboard })
+            Screen.Camera -> {
+                CropScanScreen(
+                    onBack = {
+                        screen = Screen.Dashboard
+                    },
+                    onAnalysisComplete = { result ->
+                        analysisResult = result
+                        screen = Screen.Decision
+                    }
+                )
+            }
+            Screen.Decision -> {
+                analysisResult?.let { result ->
+                    DecisionScreen(
+                        result = result,
+                        onBack = {
+                            screen = Screen.Dashboard
+                        },
+                        onAudio = {
+                            screen = Screen.AudioPlay
+                        }
+                    )
+                } ?: run {
+                    PlaceholderScreen(
+                        title = "No Decision Available",
+                        onClick = {
+                            screen = Screen.Dashboard
+                        }
+                    )
+                }
+            }
+            Screen.AudioPlay -> {
+                analysisResult?.let { result ->
+                    AudioAdvisoryScreen(
+                        result = result,
+                        onBack = { screen = Screen.Decision }
+                    )
+                } ?: PlaceholderScreen("Audio Advisory", onClick = { screen = Screen.Dashboard })
+            }
             Screen.History -> PlaceholderScreen("History", onClick = { screen = Screen.Dashboard })
             Screen.Settings -> PlaceholderScreen("Settings", onClick = { screen = Screen.Dashboard })
         }
@@ -394,7 +447,7 @@ private enum class CameraState { Scanning, ImagePreview, Analyzing }
 @Composable
 fun CropScanScreen(
     onBack: () -> Unit,
-    onAnalysisComplete: () -> Unit
+    onAnalysisComplete: (JSONObject) -> Unit
 ) {
     var currentState by remember {
         mutableStateOf(CameraState.Scanning)
@@ -495,9 +548,24 @@ fun CropScanScreen(
                     }
 
                     CameraState.Analyzing -> {
-                        AnalyzingView(
-                            onAnalysisComplete = onAnalysisComplete
-                        )
+                        capturedFile?.let { file ->
+                            AnalyzingView(
+                                imageFile = file,
+
+                                onAnalysisComplete = { result ->
+                                    println("Samsaari API response: $result")
+
+                                    onAnalysisComplete(result)
+                                },
+
+                                onError = { error ->
+                                    println("Samsaari API error: $error")
+
+                                    capturedFile = null
+                                    currentState = CameraState.Scanning
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -1052,24 +1120,811 @@ fun CapturedPreviewView(
         }
     }
 }
+suspend fun getCurrentLocation(context: Context): Location? {
+    if (
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED &&
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED
+    ) {
+        return null
+    }
+
+    val locationManager =
+        context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+    // Use existing GPS location first
+    try {
+        val gpsLocation =
+            locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+
+        if (gpsLocation != null) {
+            Log.d(
+                "Samsaari",
+                "Using last GPS location = ${gpsLocation.latitude}, ${gpsLocation.longitude}"
+            )
+            return gpsLocation
+        }
+
+        // Fallback to network location
+        val networkLocation =
+            locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+
+        if (networkLocation != null) {
+            Log.d(
+                "Samsaari",
+                "Using last network location = ${networkLocation.latitude}, ${networkLocation.longitude}"
+            )
+            return networkLocation
+        }
+    } catch (e: SecurityException) {
+        Log.e("Samsaari", "Location permission error", e)
+        return null
+    }
+
+    // No cached location → request a fresh one
+    return suspendCancellableCoroutine { continuation ->
+
+        val listener = object : android.location.LocationListener {
+
+            override fun onLocationChanged(location: Location) {
+                Log.d(
+                    "Samsaari",
+                    "Fresh GPS location = ${location.latitude}, ${location.longitude}"
+                )
+
+                if (continuation.isActive) {
+                    continuation.resume(location)
+                }
+
+                locationManager.removeUpdates(this)
+            }
+
+            override fun onProviderDisabled(provider: String) {}
+
+            override fun onProviderEnabled(provider: String) {}
+
+            @Suppress("DEPRECATION")
+            override fun onStatusChanged(
+                provider: String?,
+                status: Int,
+                extras: android.os.Bundle?
+            ) {}
+        }
+
+        try {
+            locationManager.requestLocationUpdates(
+                LocationManager.GPS_PROVIDER,
+                1000L,
+                1f,
+                listener,
+                Looper.getMainLooper()
+            )
+
+            continuation.invokeOnCancellation {
+                locationManager.removeUpdates(listener)
+            }
+
+        } catch (e: SecurityException) {
+            Log.e("Samsaari", "Failed to request GPS", e)
+
+            if (continuation.isActive) {
+                continuation.resume(null)
+            }
+        }
+    }
+}
+@Composable
+fun AnalyzingView(
+    imageFile: File,
+    onAnalysisComplete: (JSONObject) -> Unit,
+    onError: (String) -> Unit
+) {
+    val context = LocalContext.current
+
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    var permissionRequested by remember {
+        mutableStateOf(false)
+    }
+
+    val locationPermissionLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+
+            hasLocationPermission =
+                permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        }
+
+    // Ask for location permission before analysis.
+    LaunchedEffect(Unit) {
+        if (!hasLocationPermission && !permissionRequested) {
+            permissionRequested = true
+
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(imageFile, hasLocationPermission) {
+
+        if (!hasLocationPermission) {
+            return@LaunchedEffect
+        }
+
+        try {
+            println("Samsaari: Starting analysis")
+
+            val result = withContext(Dispatchers.IO) {
+
+                println("Samsaari: Getting current location")
+
+                val location = getCurrentLocation(context)
+
+                if (location == null) {
+                    throw Exception(
+                        "Unable to get your current location. Please enable GPS/location services."
+                    )
+                }
+
+                val latitude = location.latitude
+                val longitude = location.longitude
+
+                println(
+                    "Samsaari: GPS location = $latitude, $longitude"
+                )
+
+                println("Samsaari: Reading image")
+
+                val imageBytes = imageFile.readBytes()
+
+                println(
+                    "Samsaari: Image size = ${imageBytes.size} bytes"
+                )
+
+                val imageBase64 = Base64.encodeToString(
+                    imageBytes,
+                    Base64.NO_WRAP
+                )
+
+                println("Samsaari: Base64 created")
+
+                val payload = JSONObject().apply {
+
+                    put(
+                        "engine",
+                        "samsaari-v2"
+                    )
+
+                    put(
+                        "timestamp",
+                        java.time.Instant.now().toString()
+                    )
+
+                    put(
+                        "farm_profile",
+                        JSONObject().apply {
+
+                            put(
+                                "coordinates",
+                                JSONObject().apply {
+                                    put(
+                                        "latitude",
+                                        latitude
+                                    )
+
+                                    put(
+                                        "longitude",
+                                        longitude
+                                    )
+                                }
+                            )
+
+                            put(
+                                "crop",
+                                "rice"
+                            )
+                        }
+                    )
+
+                    put(
+                        "geospatial_telemetry",
+                        JSONObject()
+                    )
+
+                    put(
+                        "meteorological_risk",
+                        JSONObject()
+                    )
+
+                    put(
+                        "market_telemetry",
+                        JSONObject()
+                    )
+
+                    put(
+                        "financial_inputs",
+                        JSONObject()
+                    )
+
+                    put(
+                        "image_base64",
+                        imageBase64
+                    )
+                }
+
+                println(
+                    "Samsaari: Payload coordinates = $latitude, $longitude"
+                )
+
+                val requestBody =
+                    payload
+                        .toString()
+                        .toRequestBody(
+                            "application/json".toMediaType()
+                        )
+
+                val request =
+                    Request.Builder()
+                        .url(API_URL)
+                        .post(requestBody)
+                        .build()
+
+                println("Samsaari: Sending request")
+
+                val client =
+                    OkHttpClient.Builder()
+                        .connectTimeout(
+                            60,
+                            java.util.concurrent.TimeUnit.SECONDS
+                        )
+                        .writeTimeout(
+                            60,
+                            java.util.concurrent.TimeUnit.SECONDS
+                        )
+                        .readTimeout(
+                            120,
+                            java.util.concurrent.TimeUnit.SECONDS
+                        )
+                        .callTimeout(
+                            120,
+                            java.util.concurrent.TimeUnit.SECONDS
+                        )
+                        .build()
+
+                client.newCall(request).execute().use { response ->
+
+                    println(
+                        "Samsaari: HTTP ${response.code}"
+                    )
+
+                    val responseBody =
+                        response.body?.string()
+                            ?: throw Exception(
+                                "Empty server response"
+                            )
+
+                    println(
+                        "Samsaari: Response received"
+                    )
+
+                    println(
+                        "Samsaari: $responseBody"
+                    )
+
+                    if (!response.isSuccessful) {
+                        throw Exception(
+                            "Server error ${response.code}: $responseBody"
+                        )
+                    }
+
+                    JSONObject(responseBody)
+                }
+            }
+
+            println("Samsaari: Analysis complete")
+
+            onAnalysisComplete(result)
+
+        } catch (e: Exception) {
+
+            println(
+                "Samsaari: ERROR ${e.javaClass.simpleName}: ${e.message}"
+            )
+
+            e.printStackTrace()
+
+            onError(
+                e.message ?: "Analysis failed"
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.85f)
+                .clip(RoundedCornerShape(24.dp))
+                .background(CardBackground)
+                .border(
+                    1.dp,
+                    CardBorder,
+                    RoundedCornerShape(24.dp)
+                )
+                .padding(40.dp),
+            contentAlignment = Alignment.Center
+        ) {
+
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+
+                Box(
+                    contentAlignment = Alignment.Center
+                ) {
+
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(80.dp),
+                        color = MintAccent,
+                        strokeWidth = 6.dp,
+                        trackColor = Color.White.copy(0.1f)
+                    )
+
+                    Icon(
+                        Icons.Default.Search,
+                        contentDescription = "Analyzing",
+                        tint = MintAccent,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+
+                Spacer(
+                    modifier = Modifier.height(32.dp)
+                )
+
+                Text(
+                    "Analyzing your crop...",
+                    color = Color.White,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(
+                    modifier = Modifier.height(12.dp)
+                )
+
+                Text(
+                    if (hasLocationPermission)
+                        "Getting your location and checking field risk."
+                    else
+                        "Location permission is required for field analysis.",
+                    color = Color.White.copy(0.8f),
+                    fontSize = 16.sp,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+@Composable
+fun DecisionScreen(
+    result: JSONObject,
+    onBack: () -> Unit,
+    onAudio: () -> Unit
+) {
+    val recommendedAction = result.optString("recommended_action", "WAIT")
+    val disease = result.optString("disease", "Unknown")
+    val confidence = result.optDouble("disease_confidence", 0.0)
+    val uncertain = result.optBoolean("disease_uncertain", confidence < 0.70)
+    val scenarioA = result.optString("scenario_a_roi_inr", "N/A")
+    val scenarioB = result.optString("scenario_b_roi_inr", "N/A")
+    val risk = result.optString("risk_factor", "N/A")
+    val translatedText = result.optString(
+        "translated_text",
+        result.optString("voice_script_2_sentences", "")
+    )
+
+    SamsaariBackground {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 48.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(CardBackground)
+                ) {
+                    Icon(
+                        Icons.Default.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.White
+                    )
+                }
+
+                Text(
+                    "Decision",
+                    color = Color.White,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Text(
+                    "Samsaari",
+                    color = MintAccent.copy(alpha = 0.8f),
+                    fontSize = 18.sp,
+                    fontFamily = FontFamily.Serif
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            GlassCard {
+                Column {
+                    Text(
+                        "Crop Analysis",
+                        color = Color.White.copy(alpha = 0.75f),
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        disease,
+                        color = Color.White,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "Confidence: ${"%.1f".format(confidence * 100)}%",
+                        color = if (uncertain) AlertCoral else MintAccent,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    if (uncertain) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            "The model is below the 70% confidence threshold. The backend safety rule recommends WAIT.",
+                            color = AlertCoral,
+                            fontSize = 14.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            GlassCard {
+                Column {
+                    Text(
+                        "Recommended Action",
+                        color = Color.White.copy(alpha = 0.75f),
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        recommendedAction,
+                        color = if (recommendedAction.equals("WAIT", ignoreCase = true))
+                            AlertCoral else MintAccent,
+                        fontSize = 30.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                GlassCard(modifier = Modifier.weight(1f)) {
+                    Column {
+                        Text(
+                            "Scenario A",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 13.sp
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            "Act Today",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            scenarioA,
+                            color = MintAccent,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+
+                GlassCard(modifier = Modifier.weight(1f)) {
+                    Column {
+                        Text(
+                            "Scenario B",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 13.sp
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            "Wait",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            scenarioB,
+                            color = MintAccent,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            GlassCard {
+                Column {
+                    Text(
+                        "Risk Factor",
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        risk,
+                        color = Color.White,
+                        fontSize = 16.sp
+                    )
+                }
+            }
+
+            if (translatedText.isNotBlank()) {
+                Spacer(modifier = Modifier.height(16.dp))
+
+                GlassCard {
+                    Column {
+                        Text(
+                            "Advisory",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            translatedText,
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            lineHeight = 24.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                onClick = onAudio,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(62.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MintAccent
+                ),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(
+                    Icons.Default.PlayArrow,
+                    contentDescription = "Play audio",
+                    tint = EmeraldDark
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    "Play Audio Advisory",
+                    color = EmeraldDark,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}
 
 @Composable
-fun AnalyzingView(onAnalysisComplete: () -> Unit) {
-    LaunchedEffect(Unit) {
-        delay(3000)
-        onAnalysisComplete()
-    }
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Box(modifier = Modifier.fillMaxWidth(0.85f).clip(RoundedCornerShape(24.dp)).background(CardBackground).border(1.dp, CardBorder, RoundedCornerShape(24.dp)).padding(40.dp), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(modifier = Modifier.size(80.dp), color = MintAccent, strokeWidth = 6.dp, trackColor = Color.White.copy(0.1f))
-                    Icon(Icons.Default.Search, contentDescription = "Analyzing", tint = MintAccent, modifier = Modifier.size(32.dp))
+fun AudioAdvisoryScreen(
+    result: JSONObject,
+    onBack: () -> Unit
+) {
+    val audioBase64 = result.optString("audio_base64", "")
+    val advisory = result.optString(
+        "translated_text",
+        result.optString("voice_script_2_sentences", "")
+    )
+    val context = LocalContext.current
+
+    var isPlaying by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    DisposableEffect(audioBase64) {
+        var player: android.media.MediaPlayer? = null
+
+        if (audioBase64.isNotBlank()) {
+            try {
+                val audioBytes = Base64.decode(audioBase64, Base64.DEFAULT)
+                val audioFile = File(
+                    context.cacheDir,
+                    "samsaari_advisory_${System.currentTimeMillis()}.mp3"
+                )
+                audioFile.writeBytes(audioBytes)
+
+                player = android.media.MediaPlayer().apply {
+                    setDataSource(audioFile.absolutePath)
+                    setOnPreparedListener {
+                        isPlaying = true
+                        it.start()
+                    }
+                    setOnCompletionListener {
+                        isPlaying = false
+                    }
+                    setOnErrorListener { _, _, _ ->
+                        isPlaying = false
+                        error = "Unable to play audio"
+                        true
+                    }
+                    prepareAsync()
                 }
-                Spacer(modifier = Modifier.height(32.dp))
-                Text("Analyzing your crop...", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.height(12.dp))
-                Text("Checking crop condition and field risk.", color = Color.White.copy(0.8f), fontSize = 16.sp, textAlign = TextAlign.Center)
+            } catch (e: Exception) {
+                error = e.message ?: "Unable to prepare audio"
+            }
+        } else {
+            error = "No audio advisory was returned by the server"
+        }
+
+        onDispose {
+            player?.release()
+        }
+    }
+
+    SamsaariBackground {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 48.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(CardBackground)
+                ) {
+                    Icon(
+                        Icons.Default.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.White
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(16.dp))
+
+                Text(
+                    "Audio Advisory",
+                    color = Color.White,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(28.dp))
+
+            GlassCard {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        Icons.Default.PlayArrow,
+                        contentDescription = "Audio",
+                        tint = MintAccent,
+                        modifier = Modifier.size(64.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    Text(
+                        if (isPlaying) "Playing advisory..." else "Audio advisory",
+                        color = Color.White,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+
+                    if (advisory.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            advisory,
+                            color = Color.White.copy(alpha = 0.8f),
+                            fontSize = 16.sp,
+                            lineHeight = 24.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+
+                    error?.let {
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            it,
+                            color = AlertCoral,
+                            fontSize = 14.sp,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                onClick = {
+                    // Playback starts automatically when the MediaPlayer is prepared.
+                },
+                enabled = false,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(60.dp),
+                colors = ButtonDefaults.buttonColors(
+                    disabledContainerColor = MintAccent.copy(alpha = 0.45f)
+                ),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(
+                    if (isPlaying) Icons.Default.PlayArrow else Icons.Default.PlayArrow,
+                    contentDescription = null,
+                    tint = EmeraldDark
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    if (isPlaying) "Playing" else "Preparing Audio",
+                    color = EmeraldDark,
+                    fontWeight = FontWeight.Bold
+                )
             }
         }
     }

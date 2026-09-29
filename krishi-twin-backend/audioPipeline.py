@@ -2,6 +2,7 @@ import os
 from functools import lru_cache
 
 import requests
+
 from google.cloud import translate_v2 as translate
 from google.cloud import texttospeech
 
@@ -84,9 +85,6 @@ STATE_LANGUAGE_MAP = {
     "Maharashtra": "mr",
 
     # Hindi
-    #
-    # States where Hindi is used as the primary/default
-    # agricultural advisory language in this backend.
     "Uttar Pradesh": "hi",
     "Madhya Pradesh": "hi",
     "Rajasthan": "hi",
@@ -104,7 +102,7 @@ STATE_LANGUAGE_MAP = {
 
 
 # ============================================================
-# CLIENTS
+# GOOGLE CLOUD CLIENTS
 # ============================================================
 
 translate_client = translate.Client()
@@ -112,14 +110,12 @@ tts_client = texttospeech.TextToSpeechClient()
 
 
 # ============================================================
-# REVERSE GEOCODING
+# FREE REVERSE GEOCODING
 # ============================================================
 
-GOOGLE_GEOCODING_URL = (
-    "https://maps.googleapis.com/maps/api/geocode/json"
+NOMINATIM_URL = (
+    "https://nominatim.openstreetmap.org/reverse"
 )
-
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 
 @lru_cache(maxsize=512)
@@ -128,56 +124,82 @@ def _reverse_geocode_state(
     longitude_rounded: float
 ) -> str | None:
 
-    if not GOOGLE_MAPS_API_KEY:
-        print(
-            "WARNING: GOOGLE_MAPS_API_KEY not configured. "
-            "Using Hindi fallback."
-        )
-        return None
+    """
+    Convert GPS coordinates into a state using
+    OpenStreetMap Nominatim.
+
+    No Google Maps API key or billing is required.
+    """
 
     params = {
-        "latlng": f"{latitude_rounded},{longitude_rounded}",
-        "key": GOOGLE_MAPS_API_KEY,
-        "language": "en"
+        "lat": latitude_rounded,
+        "lon": longitude_rounded,
+        "format": "json",
+        "zoom": 10,
+        "addressdetails": 1
+    }
+
+    headers = {
+        "User-Agent": "Samsaari-KrishiTwin/1.0"
     }
 
     try:
+
         response = requests.get(
-            GOOGLE_GEOCODING_URL,
+            NOMINATIM_URL,
             params=params,
-            timeout=5
+            headers=headers,
+            timeout=10
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        if data.get("status") != "OK":
+        print("NOMINATIM RESPONSE:")
+        print(data)
+
+        address = data.get(
+            "address",
+            {}
+        )
+
+        state = address.get(
+            "state"
+        )
+
+        if state:
+
+            state = state.strip()
+
             print(
-                f"Reverse geocoding failed: "
-                f"{data.get('status')}"
+                f"Reverse geocoding state: {state}"
             )
-            return None
 
-        for result in data.get("results", []):
+            return state
 
-            for component in result.get(
-                "address_components",
-                []
-            ):
+        print(
+            "Reverse geocoding succeeded, "
+            "but state was not found."
+        )
 
-                if "administrative_area_level_1" in component.get(
-                    "types",
-                    []
-                ):
-                    return component.get("long_name")
+        return None
 
     except requests.RequestException as exc:
+
         print(
             f"Reverse geocoding request failed: {exc}"
         )
 
-    return None
+        return None
+
+    except Exception as exc:
+
+        print(
+            f"Unexpected reverse geocoding error: {exc}"
+        )
+
+        return None
 
 
 # ============================================================
@@ -188,26 +210,45 @@ def resolve_language_from_coordinates(
     lat: float,
     lon: float
 ) -> str:
-    """
-    Resolve the regional advisory language from GPS coordinates.
 
-    Uses administrative state boundaries through reverse geocoding
-    rather than overlapping latitude/longitude bounding boxes.
+    """
+    Resolve regional advisory language from GPS coordinates.
+
+    GPS coordinates are reverse-geocoded to determine the
+    state, and the state is mapped to the regional language.
     """
 
     try:
+
         lat = float(lat)
         lon = float(lon)
+
     except (TypeError, ValueError):
+
+        print(
+            "Invalid coordinates. "
+            "Falling back to Hindi."
+        )
+
         return "hi"
 
     if not (-90 <= lat <= 90):
+
+        print(
+            f"Invalid latitude: {lat}"
+        )
+
         return "hi"
 
     if not (-180 <= lon <= 180):
+
+        print(
+            f"Invalid longitude: {lon}"
+        )
+
         return "hi"
 
-    # Round coordinates so nearby requests can share the cache.
+    # Round coordinates so nearby requests can share cache.
     rounded_lat = round(lat, 4)
     rounded_lon = round(lon, 4)
 
@@ -217,16 +258,26 @@ def resolve_language_from_coordinates(
     )
 
     if not state:
+
+        print(
+            "Could not determine state. "
+            "Using Hindi fallback."
+        )
+
         return "hi"
 
+    state_normalized = state.strip()
+
     language = STATE_LANGUAGE_MAP.get(
-        state,
+        state_normalized,
         "hi"
     )
 
     print(
         f"Regional geofence: "
-        f"({lat}, {lon}) -> {state} -> {language}"
+        f"({lat}, {lon}) -> "
+        f"{state_normalized} -> "
+        f"{language}"
     )
 
     return language
@@ -236,18 +287,32 @@ def resolve_language_from_coordinates(
 # TEXT NORMALIZATION
 # ============================================================
 
-def _validate_text(raw_text: str) -> str:
+def _validate_text(
+    raw_text: str
+) -> str:
 
     if raw_text is None:
-        raise ValueError("raw_text cannot be None")
 
-    if not isinstance(raw_text, str):
-        raw_text = str(raw_text)
+        raise ValueError(
+            "raw_text cannot be None"
+        )
+
+    if not isinstance(
+        raw_text,
+        str
+    ):
+
+        raw_text = str(
+            raw_text
+        )
 
     raw_text = raw_text.strip()
 
     if not raw_text:
-        raise ValueError("raw_text cannot be empty")
+
+        raise ValueError(
+            "raw_text cannot be empty"
+        )
 
     return raw_text
 
@@ -261,24 +326,42 @@ def process_advisory_audio_by_coordinates(
     lat: float,
     lon: float
 ) -> dict:
+
     """
-    Translate and synthesize an agricultural advisory.
+    Translate and synthesize agricultural advisory
+    according to the GPS-derived regional language.
 
-    Returns raw MP3 bytes without decoding/re-encoding them.
+    Returns:
+        resolved_language
+        translated_text
+        audio_bytes
     """
 
-    raw_text = _validate_text(raw_text)
-
-    target_lang = resolve_language_from_coordinates(
-        lat,
-        lon
+    raw_text = _validate_text(
+        raw_text
     )
 
-    translated_text = raw_text
+    # --------------------------------------------------------
+    # RESOLVE REGIONAL LANGUAGE
+    # --------------------------------------------------------
+
+    target_lang = (
+        resolve_language_from_coordinates(
+            lat,
+            lon
+        )
+    )
+
+    print(
+        f"Audio target language: "
+        f"{target_lang}"
+    )
 
     # --------------------------------------------------------
     # TRANSLATION
     # --------------------------------------------------------
+
+    translated_text = raw_text
 
     if target_lang != "en":
 
@@ -293,8 +376,19 @@ def process_advisory_audio_by_coordinates(
             raw_text
         )
 
-        if not isinstance(translated_text, str):
-            translated_text = str(translated_text)
+        if not isinstance(
+            translated_text,
+            str
+        ):
+
+            translated_text = str(
+                translated_text
+            )
+
+    print(
+        f"Translated advisory: "
+        f"{translated_text}"
+    )
 
     # --------------------------------------------------------
     # VOICE SELECTION
@@ -306,39 +400,63 @@ def process_advisory_audio_by_coordinates(
     )
 
     # --------------------------------------------------------
-    # GOOGLE TTS
+    # GOOGLE CLOUD TTS
     # --------------------------------------------------------
 
-    synthesis_input = texttospeech.SynthesisInput(
-        text=translated_text
+    synthesis_input = (
+        texttospeech.SynthesisInput(
+            text=translated_text
+        )
     )
 
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=voice_config["language_code"],
-        name=voice_config["name"],
-        ssml_gender=voice_config["ssml_gender"]
+    voice = (
+        texttospeech.VoiceSelectionParams(
+            language_code=voice_config[
+                "language_code"
+            ],
+            name=voice_config[
+                "name"
+            ],
+            ssml_gender=voice_config[
+                "ssml_gender"
+            ]
+        )
     )
 
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=0.90
+    audio_config = (
+        texttospeech.AudioConfig(
+            audio_encoding=(
+                texttospeech.AudioEncoding.MP3
+            ),
+            speaking_rate=0.90
+        )
     )
 
-    response = tts_client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config
+    response = (
+        tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
     )
 
-    # IMPORTANT:
-    # response.audio_content is already binary MP3 data.
-    # DO NOT .decode(), .encode(), or convert through Latin-1.
-    audio_bytes = bytes(response.audio_content)
+    audio_bytes = bytes(
+        response.audio_content
+    )
 
     if not audio_bytes:
+
         raise RuntimeError(
-            "Google TTS returned an empty audio stream"
+            "Google TTS returned "
+            "an empty audio stream"
         )
+
+    print(
+        f"TTS generated "
+        f"{len(audio_bytes)} bytes "
+        f"using "
+        f"{voice_config['language_code']}"
+    )
 
     return {
         "resolved_language": target_lang,

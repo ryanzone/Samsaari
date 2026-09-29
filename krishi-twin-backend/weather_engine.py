@@ -23,9 +23,14 @@ load_dotenv()
 session = requests.Session()
 
 retries = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[500, 502, 503, 504],
+    total=4,
+    connect=3,
+    read=3,
+    status=4,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "HEAD"],
+    respect_retry_after_header=True,
     raise_on_status=False,
 )
 
@@ -166,8 +171,18 @@ def fetch_weather(lat: float, lon: float) -> dict:
 
     response = session.get(
         weather_url,
-        timeout=10,
+        timeout=20,
     )
+
+    # Open-Meteo can temporarily rate-limit requests with HTTP 429.
+    # The shared retry session above respects Retry-After and retries
+    # 429/5xx responses before returning control here.
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        raise RuntimeError(
+            "Open-Meteo rate limit reached after retries"
+            + (f" (Retry-After={retry_after}s)" if retry_after else "")
+        )
 
     response.raise_for_status()
 
@@ -446,6 +461,7 @@ def build_dynamic_telemetry(
     mean_ndvi = fetch_sentinel2_ndvi(lat, lon)
 
     # 3. Live weather at the GPS coordinate.
+    # Open-Meteo rate limits are retried by the shared HTTP session.
     weather = fetch_weather(lat, lon)
 
     # 4. Live market data for the GPS-derived district.

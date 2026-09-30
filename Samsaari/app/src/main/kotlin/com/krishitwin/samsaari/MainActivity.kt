@@ -78,8 +78,8 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 
 import java.io.File
+import java.util.Calendar
 
-private const val API_BASE_URL = "https://samsaari.onrender.com"
 private const val API_URL =
     "https://samsaari.onrender.com/api/v1/simulate"
 
@@ -97,7 +97,7 @@ class MainActivity : ComponentActivity() {
    SCREEN STATE & APP ROUTER
 --------------------------------------------------------- */
 private enum class Screen {
-    Splash, Dashboard, Camera, Decision, AudioPlay, History, Settings
+    Splash, Dashboard, Camera, Decision, AudioPlay
 }
 
 @Composable
@@ -107,14 +107,21 @@ fun SamsaariApp() {
 
     Crossfade(targetState = screen, label = "AppRouter") { currentScreen ->
         when (currentScreen) {
-            Screen.Splash -> SplashScreen(onFinished = { screen = Screen.Dashboard })
-            Screen.Dashboard -> DashboardScreen(
-                onScanCrop = { screen = Screen.Camera },
-                onDecision = { screen = Screen.Decision },
-                onAudio = { screen = Screen.AudioPlay },
-                onHistory = { screen = Screen.History },
-                onSettings = { screen = Screen.Settings }
+            Screen.Splash -> SplashScreen(
+                onFinished = { screen = Screen.Dashboard }
             )
+
+            Screen.Dashboard -> DashboardScreen(
+                analysisResult = analysisResult,
+                onScanCrop = { screen = Screen.Camera },
+                onDecision = {
+                    if (analysisResult != null) screen = Screen.Decision
+                },
+                onAudio = {
+                    if (analysisResult != null) screen = Screen.AudioPlay
+                }
+            )
+
             Screen.Camera -> {
                 CropScanScreen(
                     onBack = {
@@ -126,6 +133,7 @@ fun SamsaariApp() {
                     }
                 )
             }
+
             Screen.Decision -> {
                 analysisResult?.let { result ->
                     DecisionScreen(
@@ -146,16 +154,18 @@ fun SamsaariApp() {
                     )
                 }
             }
+
             Screen.AudioPlay -> {
                 analysisResult?.let { result ->
                     AudioAdvisoryScreen(
                         result = result,
                         onBack = { screen = Screen.Decision }
                     )
-                } ?: PlaceholderScreen("Audio Advisory", onClick = { screen = Screen.Dashboard })
+                } ?: PlaceholderScreen(
+                    "Audio Advisory",
+                    onClick = { screen = Screen.Dashboard }
+                )
             }
-            Screen.History -> PlaceholderScreen("History", onClick = { screen = Screen.Dashboard })
-            Screen.Settings -> PlaceholderScreen("Settings", onClick = { screen = Screen.Dashboard })
         }
     }
 }
@@ -192,30 +202,97 @@ fun SamsaariBackground(content: @Composable () -> Unit) {
                 lineTo(size.width * 0.56f, size.height)
                 close()
             }
+
             drawPath(
                 path = diagonalPath,
                 brush = Brush.linearGradient(
-                    colors = listOf(Color.Transparent, Color(0x22FFFFFF), Color(0x11FFFFFF), Color.Transparent),
+                    colors = listOf(
+                        Color.Transparent,
+                        Color(0x22FFFFFF),
+                        Color(0x11FFFFFF),
+                        Color.Transparent
+                    ),
                     start = Offset(0f, size.height * 0.40f),
                     end = Offset(size.width * 0.80f, size.height)
                 )
             )
         }
+
         content()
     }
 }
 
 /* ---------------------------------------------------------
-   DASHBOARD SCREEN
+   DYNAMIC DASHBOARD
 --------------------------------------------------------- */
 @Composable
 fun DashboardScreen(
+    analysisResult: JSONObject?,
     onScanCrop: () -> Unit,
     onDecision: () -> Unit,
-    onAudio: () -> Unit,
-    onHistory: () -> Unit,
-    onSettings: () -> Unit
+    onAudio: () -> Unit
 ) {
+    val context = LocalContext.current
+
+    var hasLocationPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    var location by remember { mutableStateOf<Location?>(null) }
+
+    val locationPermissionLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+            hasLocationPermission =
+                permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                    permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        }
+
+    LaunchedEffect(Unit) {
+        if (!hasLocationPermission) {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+        }
+    }
+
+    LaunchedEffect(hasLocationPermission) {
+        if (hasLocationPermission) {
+            location = withContext(Dispatchers.IO) {
+                getCurrentLocation(context)
+            }
+        }
+    }
+
+    val greeting = remember {
+        when (Calendar.getInstance().get(Calendar.HOUR_OF_DAY)) {
+            in 5..11 -> "Good morning"
+            in 12..16 -> "Good afternoon"
+            in 17..20 -> "Good evening"
+            else -> "Good night"
+        }
+    }
+
+    val disease = analysisResult?.optString("disease", "").orEmpty()
+    val confidence = analysisResult?.optDouble("disease_confidence", -1.0) ?: -1.0
+    val uncertain = analysisResult?.optBoolean("disease_uncertain", false) ?: false
+    val action = analysisResult?.optString("recommended_action", "").orEmpty()
+    val risk = analysisResult?.optString("risk_factor", "").orEmpty()
+    val language = analysisResult?.optString("resolved_language", "").orEmpty()
+
     SamsaariBackground {
         Column(modifier = Modifier.fillMaxSize()) {
             Column(
@@ -225,218 +302,358 @@ fun DashboardScreen(
                     .padding(horizontal = 20.dp)
             ) {
                 Spacer(modifier = Modifier.height(56.dp))
-                DashboardHeader()
-                Spacer(modifier = Modifier.height(24.dp))
-                AlertCard(onScanCrop)
-                Spacer(modifier = Modifier.height(16.dp))
-                ActiveFieldCard()
-                Spacer(modifier = Modifier.height(16.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(modifier = Modifier.weight(1f)) { CropHealthCard() }
-                    Box(modifier = Modifier.weight(1f)) { WeatherCard() }
+                    Column {
+                        Text(
+                            "Samsaari",
+                            color = Color.White,
+                            fontSize = 32.sp,
+                            fontFamily = FontFamily.Serif
+                        )
+
+                        Text(
+                            greeting,
+                            color = Color.White.copy(alpha = 0.8f),
+                            fontSize = 16.sp
+                        )
+                    }
                 }
+
                 Spacer(modifier = Modifier.height(24.dp))
-                
-                // Updated Explicit Quick Actions
-                QuickActions(onScanCrop, onDecision, onAudio)
-                
+
+                CurrentFieldCard(location = location)
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (analysisResult == null) {
+                    GlassCard {
+                        Column {
+                            Text(
+                                "No analysis yet",
+                                color = Color.White,
+                                fontSize = 20.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Text(
+                                "Scan a rice leaf to load live disease, field-risk and decision data.",
+                                color = Color.White.copy(alpha = 0.75f),
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp
+                            )
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            CropHealthCard(
+                                disease = disease,
+                                confidence = confidence,
+                                uncertain = uncertain
+                            )
+                        }
+
+                        Box(modifier = Modifier.weight(1f)) {
+                            RiskCard(
+                                action = action,
+                                risk = risk
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    GlassCard {
+                        Column {
+                            Text(
+                                "Latest Analysis",
+                                color = Color.White.copy(alpha = 0.75f),
+                                fontSize = 14.sp
+                            )
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Text(
+                                disease.ifBlank { "Analysis complete" },
+                                color = Color.White,
+                                fontSize = 22.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            if (confidence >= 0.0) {
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Text(
+                                    "Confidence: ${"%.1f".format(confidence * 100)}%",
+                                    color = if (uncertain) AlertCoral else MintAccent,
+                                    fontSize = 14.sp
+                                )
+                            }
+
+                            if (language.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Text(
+                                    "Advisory language: ${language.uppercase()}",
+                                    color = Color.White.copy(alpha = 0.7f),
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(24.dp))
-                RecentDecisionsList()
+
+                Text(
+                    "Actions",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = onScanCrop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(72.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MintAccent
+                    ),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Search,
+                        contentDescription = "Scan",
+                        tint = EmeraldDark
+                    )
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    Text(
+                        "Scan Crop",
+                        color = EmeraldDark,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
+                }
+
+                if (analysisResult != null) {
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Button(
+                            onClick = onDecision,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CardBackground
+                            ),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.List,
+                                    contentDescription = "Decision",
+                                    tint = Color.White
+                                )
+
+                                Text(
+                                    "Decision",
+                                    color = Color.White,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = onAudio,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(64.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = CardBackground
+                            ),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.PlayArrow,
+                                    contentDescription = "Audio",
+                                    tint = Color.White
+                                )
+
+                                Text(
+                                    "Audio",
+                                    color = Color.White,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(32.dp))
             }
-            
-            // Updated Tab Bar Navigation
-            SamsaariBottomNav(
-                onHistory = onHistory,
-                onSettings = onSettings
+        }
+    }
+}
+
+@Composable
+fun CurrentFieldCard(location: Location?) {
+    GlassCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Current Field",
+                    color = Color.White,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (location != null) {
+                    Text(
+                        "GPS location available",
+                        color = MintAccent,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        "%.6f, %.6f".format(
+                            location.latitude,
+                            location.longitude
+                        ),
+                        color = Color.White.copy(alpha = 0.75f),
+                        fontSize = 13.sp
+                    )
+                } else {
+                    Text(
+                        "Waiting for device location...",
+                        color = Color.White.copy(alpha = 0.75f),
+                        fontSize = 14.sp
+                    )
+                }
+            }
+
+            Icon(
+                Icons.Default.LocationOn,
+                contentDescription = "Current location",
+                tint = MintAccent,
+                modifier = Modifier.size(32.dp)
             )
         }
     }
 }
 
 @Composable
-fun DashboardHeader() {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column {
-            Text("Samsaari", color = Color.White, fontSize = 32.sp, fontFamily = FontFamily.Serif)
-            Text("Good morning, Farmer", color = Color.White.copy(alpha = 0.8f), fontSize = 16.sp)
-        }
-        Box(modifier = Modifier.size(44.dp).clip(CircleShape).background(MintAccent), contentAlignment = Alignment.Center) {
-            Icon(Icons.Default.Person, contentDescription = "Profile", tint = Emerald800)
-        }
-    }
-}
-
-@Composable
-fun AlertCard(onScanCrop: () -> Unit) {
-    Box(
-        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(AlertCoral.copy(0.15f)).border(1.dp, AlertCoral.copy(0.4f), RoundedCornerShape(20.dp)).padding(16.dp)
-    ) {
-        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            Column(modifier = Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Warning, contentDescription = "Warning", tint = AlertCoral, modifier = Modifier.size(20.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Crop needs attention", color = AlertCoral, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text("Possible Leaf Blight detected.", color = Color.White, fontSize = 14.sp)
-            }
-            Button(onClick = onScanCrop, colors = ButtonDefaults.buttonColors(containerColor = AlertCoral), shape = RoundedCornerShape(12.dp)) {
-                Text("Analyze", color = EmeraldDark, fontWeight = FontWeight.Bold)
-            }
-        }
-    }
-}
-
-@Composable
-fun ActiveFieldCard() {
-    GlassCard {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Column {
-                Text("My Tomato Field", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                Text("Crop: Tomato  •  Area: 2 acres", color = Color.White.copy(0.7f), fontSize = 14.sp)
-                Spacer(modifier = Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.LocationOn, contentDescription = "Location", tint = MintAccent, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Madurai District", color = MintAccent, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                }
-            }
-            Box(modifier = Modifier.size(64.dp).clip(RoundedCornerShape(14.dp)).background(Color.White.copy(0.2f)), contentAlignment = Alignment.Center) {
-                Icon(Icons.Default.Place, contentDescription = "Map", tint = Color.White, modifier = Modifier.size(32.dp))
-            }
-        }
-    }
-}
-
-@Composable
-fun CropHealthCard() {
-    GlassCard(modifier = Modifier.fillMaxHeight()) {
-        Column {
-            Text("Crop Health", color = Color.White.copy(0.8f), fontSize = 14.sp)
-            Text("Needs Attention", color = AlertCoral, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(progress = { 0.37f }, modifier = Modifier.size(32.dp), color = AlertCoral, trackColor = Color.White.copy(0.2f), strokeWidth = 4.dp)
-                Spacer(modifier = Modifier.width(12.dp))
-                Text("NDVI: 0.37\nUpdated Today", color = Color.White.copy(0.7f), fontSize = 12.sp, lineHeight = 16.sp)
-            }
-        }
-    }
-}
-
-@Composable
-fun WeatherCard() {
-    GlassCard(modifier = Modifier.fillMaxHeight()) {
-        Column {
-            Text("Weather", color = Color.White.copy(0.8f), fontSize = 14.sp)
-            Text("29°C", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("Partly Cloudy", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text("Rain: 40% • Wind: 12km/h", color = Color.White.copy(0.7f), fontSize = 12.sp)
-        }
-    }
-}
-
-@Composable
-fun QuickActions(onScanCrop: () -> Unit, onDecision: () -> Unit, onAudio: () -> Unit) {
-    Text("Quick Actions", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-    Spacer(modifier = Modifier.height(12.dp))
-    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        
-        // Action 1: Scan Crop
-        Button(
-            onClick = onScanCrop, 
-            modifier = Modifier.fillMaxWidth().height(72.dp), 
-            colors = ButtonDefaults.buttonColors(containerColor = MintAccent), 
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Icon(Icons.Default.Search, contentDescription = "Scan", tint = EmeraldDark)
-            Spacer(modifier = Modifier.width(12.dp))
-            Text("Scan Crop (Camera)", color = EmeraldDark, fontWeight = FontWeight.Bold, fontSize = 18.sp)
-        }
-        
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            // Action 2: Decisions
-            Button(
-                onClick = onDecision, 
-                modifier = Modifier.weight(1f).height(72.dp), 
-                colors = ButtonDefaults.buttonColors(containerColor = CardBackground), 
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(Icons.Default.List, contentDescription = "Decisions", tint = Color.White)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text("Decision (A vs B)", color = Color.White, fontSize = 12.sp)
-                }
-            }
-            
-            // Action 3: Audio Advisory
-            Button(
-                onClick = onAudio, 
-                modifier = Modifier.weight(1f).height(72.dp), 
-                colors = ButtonDefaults.buttonColors(containerColor = CardBackground), 
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = "Play Audio", tint = Color.White)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text("Audio Advisory", color = Color.White, fontSize = 12.sp)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun RecentDecisionsList() {
-    Text("Recent Analyses", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-    Spacer(modifier = Modifier.height(12.dp))
-    GlassCard {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Column {
-                Text("Tomato • Leaf Blight", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Text("Decision: Act Today", color = MintAccent, fontSize = 14.sp)
-            }
-            Text("Yesterday", color = Color.White.copy(0.6f), fontSize = 12.sp)
-        }
-    }
-}
-
-@Composable
-fun SamsaariBottomNav(
-    onHistory: () -> Unit,
-    onSettings: () -> Unit
+fun CropHealthCard(
+    disease: String,
+    confidence: Double,
+    uncertain: Boolean
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth().background(EmeraldDark.copy(0.95f)).padding(vertical = 12.dp, horizontal = 32.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        NavItem(Icons.Default.Home, "Home", isSelected = true, onClick = {})
-        NavItem(Icons.Default.DateRange, "History", isSelected = false, onClick = onHistory)
-        NavItem(Icons.Default.Settings, "Settings", isSelected = false, onClick = onSettings)
+    GlassCard(modifier = Modifier.fillMaxHeight()) {
+        Column {
+            Text(
+                "Crop Analysis",
+                color = Color.White.copy(0.8f),
+                fontSize = 14.sp
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                disease.ifBlank { "Unknown" },
+                color = if (uncertain) AlertCoral else Color.White,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+
+            if (confidence >= 0.0) {
+                Spacer(modifier = Modifier.height(14.dp))
+
+                CircularProgressIndicator(
+                    progress = {
+                        confidence.coerceIn(0.0, 1.0).toFloat()
+                    },
+                    modifier = Modifier.size(32.dp),
+                    color = if (uncertain) AlertCoral else MintAccent,
+                    trackColor = Color.White.copy(0.2f),
+                    strokeWidth = 4.dp
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    "${"%.1f".format(confidence * 100)}% confidence",
+                    color = Color.White.copy(0.7f),
+                    fontSize = 12.sp
+                )
+            }
+        }
     }
 }
 
 @Composable
-fun NavItem(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, isSelected: Boolean, onClick: () -> Unit) {
-    val tint = if (isSelected) MintAccent else Color.White.copy(0.5f)
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier.clickable { onClick() }.padding(8.dp)
-    ) {
-        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(28.dp))
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(label, color = tint, fontSize = 12.sp, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+fun RiskCard(
+    action: String,
+    risk: String
+) {
+    GlassCard(modifier = Modifier.fillMaxHeight()) {
+        Column {
+            Text(
+                "Field Risk",
+                color = Color.White.copy(0.8f),
+                fontSize = 14.sp
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                action.ifBlank { "WAIT" },
+                color = if (action.equals("WAIT", ignoreCase = true)) {
+                    AlertCoral
+                } else {
+                    MintAccent
+                },
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Text(
+                risk.ifBlank { "Risk data returned by the analysis engine." },
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                maxLines = 6
+            )
+        }
     }
 }
 

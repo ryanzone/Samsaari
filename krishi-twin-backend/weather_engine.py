@@ -2,7 +2,7 @@ import os
 import json
 import requests
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
@@ -47,104 +47,6 @@ session.headers.update({
     ),
     "Accept": "application/json",
 })
-
-
-# ============================================================
-# GOOGLE EARTH ENGINE - SENTINEL-2 NDVI
-# ============================================================
-
-def fetch_sentinel2_ndvi(lat: float, lon: float) -> float:
-    """
-    Fetch live Sentinel-2 NDVI from Google Earth Engine.
-    Falls back to 0.37 if GEE is unavailable.
-    """
-
-    try:
-        import ee
-
-        key_path = "gcp-key.json"
-
-        if os.path.exists(key_path):
-            with open(key_path, "r") as f:
-                key_data = json.load(f)
-
-            client_email = key_data.get("client_email")
-            project_id = key_data.get("project_id")
-
-            if client_email and project_id:
-                credentials = ee.ServiceAccountCredentials(
-                    client_email,
-                    key_path,
-                )
-                ee.Initialize(
-                    credentials,
-                    project=project_id,
-                )
-            else:
-                ee.Initialize()
-        else:
-            ee.Initialize()
-
-        point = ee.Geometry.Point([lon, lat])
-
-        start_date = (
-            datetime.now(timezone.utc) - timedelta(days=120)
-        ).strftime("%Y-%m-%d")
-
-        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        s2_collection = (
-            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-            .filterBounds(point)
-            .filterDate(start_date, end_date)
-            .filter(
-                ee.Filter.lt(
-                    "CLOUDY_PIXEL_PERCENTAGE",
-                    30,
-                )
-            )
-            .sort("system:time_start", False)
-        )
-
-        image = s2_collection.first()
-
-        ndvi_image = (
-            image
-            .normalizedDifference(["B8", "B4"])
-            .rename("NDVI")
-        )
-
-        stats = ndvi_image.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=point.buffer(200),
-            scale=10,
-        )
-
-        res = stats.getInfo()
-
-        mean_ndvi = res.get("NDVI") if res else None
-
-        if mean_ndvi is not None:
-            mean_ndvi = round(float(mean_ndvi), 4)
-
-            print(
-                f"Sentinel-2 Live NDVI Fetched via GEE: {mean_ndvi}",
-                flush=True,
-            )
-
-            return mean_ndvi
-
-    except Exception as e:
-        print(
-            "Earth Engine NDVI Query Warning: "
-            f"{type(e).__name__} ({e}). "
-            "Falling back to baseline model index 0.37.",
-            flush=True,
-        )
-
-    raise RuntimeError(
-        "Live Sentinel-2 NDVI could not be retrieved for the supplied GPS coordinates."
-    )
 
 
 # ============================================================
@@ -467,17 +369,14 @@ def build_dynamic_telemetry(
     # 1. GPS-derived district/state.
     location = resolve_location_from_coordinates(lat, lon)
 
-    # 2. Live Sentinel-2 NDVI at the GPS coordinate.
-    mean_ndvi = fetch_sentinel2_ndvi(lat, lon)
-
-    # 3. Live weather at the GPS coordinate.
+    # 2. Live weather at the GPS coordinate.
     # Open-Meteo rate limits are retried by the shared HTTP session.
     weather = fetch_weather(lat, lon)
 
-    # 4. Live market data for the GPS-derived district.
+    # 3. Live market data for the GPS-derived district.
     market_info = fetch_market_data(crop, location["district"])
 
-    # 5. Financial calculations based on live market price.
+    # 4. Financial calculations based on live market price.
     modal_price_per_kg = market_info["price_inr_per_kg"]
 
     spray_cost_inr = round(acres * 425.0, 2)
@@ -495,12 +394,7 @@ def build_dynamic_telemetry(
 
     return {
         "location": location,
-        "geospatial_telemetry": {
-            "mean_ndvi_index": mean_ndvi,
-            "canopy_vigor": (
-                "Stressed" if mean_ndvi < 0.4 else "Healthy"
-            ),
-        },
+        "geospatial_telemetry": {},
         "meteorological_risk": weather,
         "market_telemetry": market_info,
         "financial_inputs": {
@@ -549,7 +443,6 @@ def run_weather_engine(
 
     location = dynamic["location"]
     district = location["district"]
-    mean_ndvi = dynamic["geospatial_telemetry"]["mean_ndvi_index"]
     weather = dynamic["meteorological_risk"]
     market_info = dynamic["market_telemetry"]
     spray_cost_inr = dynamic["financial_inputs"]["spray_cost_inr"]
@@ -578,14 +471,7 @@ def run_weather_engine(
             "detected_symptom": symptom,
         },
 
-        "geospatial_telemetry": {
-            "mean_ndvi_index": mean_ndvi,
-            "canopy_vigor": (
-                "Stressed"
-                if mean_ndvi < 0.4
-                else "Healthy"
-            ),
-        },
+        "geospatial_telemetry": {},
 
         "meteorological_risk": weather,
 

@@ -168,7 +168,7 @@ Compare:
 Scenario A = Spray/Act Today
 Scenario B = Wait 48 hours / Defer Action
 
-Use the provided weather, crop, market, NDVI, financial and
+Use the provided weather, crop, market, financial and
 disease information.
 
 Output a JSON object with these exact keys:

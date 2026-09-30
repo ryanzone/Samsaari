@@ -145,12 +145,28 @@ def _reverse_geocode_state(
 
     try:
 
-        response = requests.get(
-            NOMINATIM_URL,
-            params=params,
-            headers=headers,
-            timeout=10
-        )
+        # Nominatim has a strict public-service usage policy and can
+        # temporarily return HTTP 429 when requests arrive too quickly.
+        # Retry slowly instead of failing the entire Samsaari simulation.
+        response = None
+        for attempt in range(3):
+            response = requests.get(
+                NOMINATIM_URL,
+                params=params,
+                headers=headers,
+                timeout=10
+            )
+
+            if response.status_code != 429:
+                break
+
+            wait_seconds = 2 + (attempt * 2)
+            print(
+                f"Nominatim rate-limited (HTTP 429). "
+                f"Retrying in {wait_seconds}s..."
+            )
+            import time
+            time.sleep(wait_seconds)
 
         response.raise_for_status()
 
@@ -248,9 +264,11 @@ def resolve_language_from_coordinates(
 
         return "hi"
 
-    # Round coordinates so nearby requests can share cache.
-    rounded_lat = round(lat, 4)
-    rounded_lon = round(lon, 4)
+    # Round to ~100 m so tiny GPS movements during a presentation
+    # reuse the same reverse-geocoding result instead of repeatedly
+    # calling the public Nominatim service.
+    rounded_lat = round(lat, 3)
+    rounded_lon = round(lon, 3)
 
     state = _reverse_geocode_state(
         rounded_lat,

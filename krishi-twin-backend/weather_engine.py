@@ -370,8 +370,24 @@ def build_dynamic_telemetry(
     location = resolve_location_from_coordinates(lat, lon)
 
     # 2. Live weather at the GPS coordinate.
-    # Open-Meteo rate limits are retried by the shared HTTP session.
-    weather = fetch_weather(lat, lon)
+    # Open-Meteo may rate-limit shared Render infrastructure.
+    # Keep the simulation alive if live weather is temporarily unavailable.
+    try:
+        weather = fetch_weather(lat, lon)
+    except Exception as e:
+        print(
+            f"Open-Meteo unavailable ({type(e).__name__}: {e}). "
+            "Continuing with a neutral weather fallback.",
+            flush=True,
+        )
+        weather = {
+            "rainfall_probability": 0,
+            "rain_next_24h_mm": 0,
+            "wind_speed_kmh": 0,
+            "washoff_risk": "UNKNOWN",
+            "weather_available": False,
+            "weather_source": "Open-Meteo unavailable",
+        }
 
     # 3. Live market data for the GPS-derived district.
     market_info = fetch_market_data(crop, location["district"])

@@ -1629,7 +1629,7 @@ fun AnalyzingView(
                             java.util.concurrent.TimeUnit.SECONDS
                         )
                         .callTimeout(
-                            120,
+                            180,
                             java.util.concurrent.TimeUnit.SECONDS
                         )
                         .build()

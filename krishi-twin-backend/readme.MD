@@ -58,9 +58,9 @@ The platform combines geospatial information, weather forecasts, agricultural te
 
 ## 2. Team Workflows & Responsibilities
 
-- **R — Lead & Core AI Engine:** Develops and operates the FastAPI backend in `main.py`, coordinates counterfactual simulations using Gemini, and integrates the text-to-speech pipeline.
+- **R — Lead & Core AI Engine and UI/UX:** Develops and operates the FastAPI backend in `main.py`, coordinates counterfactual simulations using Gemini, and integrates the text-to-speech pipeline.
 - **S — Data Pipelines & Geospatial:** Handles weather telemetry using Open-Meteo and satellite NDVI data, preparing farm-specific payloads for the backend.
-- **J — UI/UX & Voice Interface:** Develops the interface for comparing Scenario A and Scenario B and integrates multilingual audio playback through `/api/v1/tts` or HTML5 audio elements.
+- **J — Voice Interface:** Develops the interface for comparing Scenario A and Scenario B and integrates multilingual audio playback through `/api/v1/tts` or HTML5 audio elements.
 
 ---
 
